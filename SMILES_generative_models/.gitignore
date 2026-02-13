@@ -1,0 +1,48 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+mcp_venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Tests/coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.python-version
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE/editor
+.vscode/
+.idea/
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+.env.*

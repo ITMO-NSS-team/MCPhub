@@ -1,0 +1,14 @@
+[project]
+name = "smiles-generative-models-mcp"
+version = "0.1.0"
+description = "Dependencies for MCP utilities (Python 3.13)"
+readme = "README_mcp.md"
+requires-python = "==3.13.*"
+dependencies = [
+  "fastmcp",
+  "requests",
+  "pandas",
+  "openpyxl",
+  "pyarrow",
+  "uvicorn",
+]

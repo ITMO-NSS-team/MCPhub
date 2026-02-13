@@ -1,0 +1,6 @@
+fastmcp
+requests
+pandas
+openpyxl
+pyarrow
+uvicorn
