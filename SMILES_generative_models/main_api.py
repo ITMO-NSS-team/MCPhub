@@ -194,16 +194,16 @@ if __name__=='__main__':
 
     @app.post("/gan_case_generator")
     def case_run(data:GenData=Body()):
-        hf_hub_download(repo_id="SoloWayG/Molecule_transformer",
-                         filename="state.json",
-                         local_dir=local_dir,
-                         force_download=True,
-                         token=os.getenv("HF_TOKEN"))
-        snapshot_download(repo_id="SoloWayG/Molecule_transformer",
-                    allow_patterns ="GAN_weights/*",
-                    local_dir='autotrain/',
-                    force_download=True,
-                    token=os.getenv("HF_TOKEN"))
+        # hf_hub_download(repo_id="SoloWayG/Molecule_transformer",
+        #                  filename="state.json",
+        #                  local_dir=local_dir,
+        #                  force_download=True,
+        #                  token=os.getenv("HF_TOKEN"))
+        # snapshot_download(repo_id="SoloWayG/Molecule_transformer",
+        #             allow_patterns =["GAN_weights/*", "many_prop_CVAE/*"],
+        #             local_dir='autotrain/',
+        #             force_download=True,
+        #             token=os.getenv("HF_TOKEN"))
         return json.dumps(gan_auto_generator(data))
     
     @app.post("/train_gen_models")
@@ -274,8 +274,6 @@ if __name__=='__main__':
         ######### WILL BE SUPPRESED!!!#########
     #############################################
 
-    if is_public_API:
-        uvicorn_ip = '0.0.0.0'
-    else:
-        uvicorn_ip = '127.0.0.1' 
-    uvicorn.run(app,host=uvicorn_ip,port=int(os.getenv('GEN_APP_PORT')),log_level='info')
+    # Force localhost so MCP can reach the API locally.
+    uvicorn_ip = '127.0.0.1'
+    uvicorn.run(app,host=uvicorn_ip,port=int(os.getenv('GEN_APP_PORT', '8000')),log_level='info')

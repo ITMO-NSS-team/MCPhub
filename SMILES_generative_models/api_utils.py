@@ -2,6 +2,7 @@ from typing import List
 from fastapi import Body
 import os
 import sys
+import types
 from pydantic import BaseModel
 from inference import predict_smiles
 from autotrain.utils.base_state import TrainState
@@ -28,11 +29,59 @@ from autodock_vina_python3.src.docking_score import docking_list
 from utils.check_novelty import check_novelty_chembl
 import pickle
 from GAN.gan_lstm_refactoring.train_gan import auto_train
-import GAN.gan_lstm_refactoring.scripts.model as KOSTIL_FOR_PICKL
-sys.modules['scripts.model'] = KOSTIL_FOR_PICKL
-sys.modules['scripts.utils'] = KOSTIL_FOR_PICKL
-sys.modules['scripts.layers'] = KOSTIL_FOR_PICKL
-sys.modules['scripts.tokenizer'] = KOSTIL_FOR_PICKL
+import GAN.gan_lstm_refactoring.scripts.model as GAN_PICKLE_MODEL
+import GAN.gan_lstm_refactoring.scripts.utils as GAN_PICKLE_UTILS
+import GAN.gan_lstm_refactoring.scripts.layers as GAN_PICKLE_LAYERS
+import GAN.gan_lstm_refactoring.scripts.tokenizer as GAN_PICKLE_TOKENIZER
+
+
+def _register_gan_pickle_aliases():
+    # Backward compatibility for checkpoints pickled with legacy `scripts.*` paths.
+    scripts_pkg = sys.modules.get("scripts")
+    if scripts_pkg is None:
+        scripts_pkg = types.ModuleType("scripts")
+        scripts_pkg.__path__ = []
+        sys.modules["scripts"] = scripts_pkg
+
+    sys.modules["GAN.gan_lstm_refactoring.scripts.model"] = GAN_PICKLE_MODEL
+    sys.modules["GAN.gan_lstm_refactoring.scripts.utils"] = GAN_PICKLE_UTILS
+    sys.modules["GAN.gan_lstm_refactoring.scripts.layers"] = GAN_PICKLE_LAYERS
+    sys.modules["GAN.gan_lstm_refactoring.scripts.tokenizer"] = GAN_PICKLE_TOKENIZER
+    sys.modules["scripts.model"] = GAN_PICKLE_MODEL
+    sys.modules["scripts.utils"] = GAN_PICKLE_UTILS
+    sys.modules["scripts.layers"] = GAN_PICKLE_LAYERS
+    sys.modules["scripts.tokenizer"] = GAN_PICKLE_TOKENIZER
+
+    scripts_pkg.model = GAN_PICKLE_MODEL
+    scripts_pkg.utils = GAN_PICKLE_UTILS
+    scripts_pkg.layers = GAN_PICKLE_LAYERS
+    scripts_pkg.tokenizer = GAN_PICKLE_TOKENIZER
+
+
+_register_gan_pickle_aliases()
+
+
+def _normalize_prop_values(values, expected_size: int) -> list:
+    if values is None:
+        return [None] * expected_size
+    if isinstance(values, pd.Series):
+        values = values.tolist()
+    elif hasattr(values, "tolist") and not isinstance(values, list):
+        values = values.tolist()
+    elif isinstance(values, tuple):
+        values = list(values)
+    elif not isinstance(values, list):
+        values = [values] * expected_size
+
+    if expected_size == 0:
+        return []
+    if len(values) == expected_size:
+        return values
+    if len(values) == 1:
+        return values * expected_size
+    if len(values) > expected_size:
+        return values[:expected_size]
+    return values + [None] * (expected_size - len(values))
 
 
 class GenData(BaseModel):
@@ -208,39 +257,69 @@ def gan_case_trainer(data:TrainData=Body()):
         state.gen_model_upd_status(case=data.case,error=str(e))
 
 def gan_auto_generator(data:GenData=Body()):
-    print(sys.path)
     state = TrainState(state_path='autotrain/utils/state.json')
 
-    try:
-        with open(state(data.case_,'gen')['weights_path']+'/gan_weights.pkl', "rb") as f:
-            gan_mol = pickle.load(f)
-    except:
-         gan_mol = pickle.load(open('GAN/gan_lstm_refactoring/weights/v4_gan_mol_124_0.0003_8k.pkl', 'rb'))
+    gen_state = state(data.case_, 'gen')
+    weights_candidates = []
+    if gen_state is not None and gen_state.get('weights_path'):
+        weights_candidates.append(os.path.join(gen_state['weights_path'], 'gan_weights.pkl'))
+    weights_candidates.extend([
+        os.path.join('autotrain', 'many_prop_CVAE', 'weights_8p_alzhmr', 'gan_weights.pkl'),
+        os.path.join('GAN', 'gan_lstm_refactoring', 'weights', 'v4_gan_mol_124_0.0003_8k.pkl')
+    ])
+    weights_candidates = list(dict.fromkeys(weights_candidates))
+
+    gan_mol = None
+    load_errors = []
+    for weights_path in weights_candidates:
+        if not os.path.isfile(weights_path):
+            continue
+        try:
+            with open(weights_path, "rb") as f:
+                gan_mol = pickle.load(f)
+            print(f'Loaded GAN weights from: {weights_path}')
+            break
+        except Exception as e:
+            load_errors.append(f'{weights_path}: {e}')
+
+    if gan_mol is None:
+        raise FileNotFoundError(
+            f'Could not load GAN weights. Checked: {weights_candidates}. '
+            f'Load errors: {load_errors}'
+        )
     
     gan_mol.eval()
+    calc_props = state()["Calculateble properties"]
     samples = gan_mol.generate_n(data.numb_mol)
-    valid_mols = state()["Calculateble properties"]['Validity'](samples)
-    unique_mols = set(valid_mols)
-    DYPLICATES = 1-len(unique_mols)/len(valid_mols)
-    VALID = len(valid_mols)/len(samples)
-    props_for_calc = [i for i in state.show_calculateble_propreties() if i !="Validity"]
-    print(props_for_calc)
-    props = {key:state()["Calculateble properties"][key](valid_mols) for key in props_for_calc}
-    props['Validity'] = VALID
-    props["Duplicates"] = DYPLICATES
-    print(props)
-    print(os.getenv('ML_MODEL_URL'))
-    try:
-        if state(data.case_,'ml')['status'] == 'Trained':
-            ml_props = predict_smiles(valid_mols,data.case_,url=os.getenv('ML_MODEL_URL'))
-            for key,value in ml_props.items():
-                props[key]=value
-    except:
-        ml_props = predict_smiles(valid_mols,'Base',url=os.getenv('ML_MODEL_URL'))
-        for key,value in ml_props.items():
-            props[key]=value
-    df = pd.DataFrame(data = {'Smiles':valid_mols,**props})
-    return df.to_dict('list')
+    valid_mols = calc_props['Validity'](samples)
+    if not isinstance(valid_mols, list):
+        valid_mols = list(valid_mols) if valid_mols is not None else []
+
+    valid_count = len(valid_mols)
+    generated_count = len(samples) if samples is not None else 0
+    unique_count = len(set(valid_mols))
+    duplicates = 1 - (unique_count / valid_count) if valid_count else 0.0
+    validity = (valid_count / generated_count) if generated_count else 0.0
+
+    props_for_calc = [name for name in state.show_calculateble_propreties() if name != "Validity"]
+    result = {'Smiles': valid_mols}
+    for key in props_for_calc:
+        raw_values = calc_props[key](valid_mols) if valid_count else []
+        result[key] = _normalize_prop_values(raw_values, valid_count)
+
+    result['Validity'] = [validity] * valid_count
+    result["Duplicates"] = [duplicates] * valid_count
+    # print(os.getenv('ML_MODEL_URL'))
+    # try:
+    #     if state(data.case_,'ml')['status'] == 'Trained':
+    #         ml_props = predict_smiles(valid_mols,data.case_,url=os.getenv('ML_MODEL_URL'))
+    #         for key,value in ml_props.items():
+    #             props[key]=value
+    # except:
+    #     ml_props = predict_smiles(valid_mols,'Base',url=os.getenv('ML_MODEL_URL'))
+    #     for key,value in ml_props.items():
+    #         props[key]=value
+    return result
     #return samples
 
 

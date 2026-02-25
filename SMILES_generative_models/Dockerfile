@@ -61,7 +61,7 @@ RUN conda create -n MCP_env python=3.13 && \
 RUN ~/miniconda3/envs/Mol_gen_env/bin/huggingface-cli download SoloWayG/Molecule_transformer --local-dir autotrain/
 
 # Настройка переменных окружения
-ENV ML_MODEL_URL=ML_MODEL_URL
+ENV ML_MODEL_URL=$ML_MODEL_URL
 ENV HF_TOKEN=$HF_TOK
 ENV LD_LIBRARY_PATH="/opt/conda/envs/Mol_gen_env/lib:$LD_LIBRARY_PATH"
 ENV PYTHONPATH="/projects/generative_models:$PYTHONPATH"
