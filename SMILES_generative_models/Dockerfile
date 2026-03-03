@@ -5,9 +5,9 @@ ENV TZ=Europe/Moscow
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 ARG HF_TOK
 ARG GITHUB_TOKEN
-ARG GEN_APP_PORT
-ARG ML_MODEL_URL
-ARG MCP_PORT
+ARG GEN_MOLS_MODEL_APP_PORT
+ARG ML_MOLS_MODEL_APP_URL
+ARG MOLS_GEN_MCP_PORT
 
 # Установка базовых зависимостей
 RUN apt-get update && apt-get install --no-install-recommends -y \
@@ -61,14 +61,14 @@ RUN conda create -n MCP_env python=3.13 && \
 RUN ~/miniconda3/envs/Mol_gen_env/bin/huggingface-cli download SoloWayG/Molecule_transformer --local-dir autotrain/
 
 # Настройка переменных окружения
-ENV ML_MODEL_URL=$ML_MODEL_URL
+ENV ML_MOLS_MODEL_APP_URL=$ML_MOLS_MODEL_APP_URL
 ENV HF_TOKEN=$HF_TOK
 ENV LD_LIBRARY_PATH="/opt/conda/envs/Mol_gen_env/lib:$LD_LIBRARY_PATH"
 ENV PYTHONPATH="/projects/generative_models:$PYTHONPATH"
 ENV PYTHONPATH="/projects/CoScientist/:$PYTHONPATH"
 ENV PYTHONPATH="/projects/:$PYTHONPATH"
-ENV GEN_APP_PORT=$GEN_APP_PORT
-ENV MCP_PORT=$MCP_PORT
+ENV GEN_MOLS_MODEL_APP_PORT=$GEN_MOLS_MODEL_APP_PORT
+ENV MOLS_GEN_MCP_PORT=$MOLS_GEN_MCP_PORT
 # Запуск
 RUN chmod +x /projects/generative_models/api.sh
 ENTRYPOINT ["/bin/bash", "/projects/generative_models/api.sh"]

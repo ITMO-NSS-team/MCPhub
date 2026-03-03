@@ -276,4 +276,4 @@ if __name__=='__main__':
 
     # Force localhost so MCP can reach the API locally.
     uvicorn_ip = '127.0.0.1'
-    uvicorn.run(app,host=uvicorn_ip,port=int(os.getenv('GEN_APP_PORT', '8000')),log_level='info')
+    uvicorn.run(app,host=uvicorn_ip,port=int(os.getenv('GEN_MOLS_MODEL_APP_PORT', '8000')),log_level='info')

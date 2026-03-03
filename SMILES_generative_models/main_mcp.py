@@ -27,7 +27,7 @@ def _build_base_url(base_env: str, default_port: str) -> str:
     return f"http://localhost:{default_port}"
 
 
-DEFAULT_API_PORT = str((os.getenv("GEN_APP_PORT") or "8000")).strip()
+DEFAULT_API_PORT = str((os.getenv("GEN_MOLS_MODEL_APP_PORT") or "8000")).strip()
 PRED_BASE_URL = _build_base_url(base_env="ML_TOOLS_BASE_URL", default_port=DEFAULT_API_PORT)
 GEN_BASE_URL = _build_base_url(base_env="DL_TOOLS_BASE_URL", default_port=DEFAULT_API_PORT)
 
@@ -472,7 +472,7 @@ if __name__ == "__main__":
     transport = os.getenv("MCP_TRANSPORT", "http")
     if transport == "http":
         host = os.getenv("MCP_HOST", "0.0.0.0")
-        port = int(os.getenv("MCP_PORT", "8000"))
+        port = int(os.getenv("MOLS_GEN_MCP_PORT", "8000"))
         mcp.run(transport="http", host=host, port=port)
     else:
         mcp.run()

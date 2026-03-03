@@ -91,7 +91,7 @@ class GenData(BaseModel):
         mean_:float=0
         std_:float=1
         case_ : str = 'RNMD'
-        url:str = os.getenv('ML_MODEL_URL')
+        url:str = os.getenv('ML_MOLS_MODEL_APP_URL')
 
 class TrainData(BaseModel):
         data:dict = None
@@ -103,7 +103,7 @@ class TrainData(BaseModel):
         feature_column:list = ['Smiles']
         path_to_save:str = 'automl/trained_data'
         description:str = 'Unknown case.'
-        url:str = os.getenv('ML_MODEL_URL')
+        url:str = os.getenv('ML_MOLS_MODEL_APP_URL')
         n_samples:int = 1000
         fine_tune:bool = True
         new_vocab:bool = False
@@ -188,7 +188,7 @@ def case_trainer(data:TrainData=Body()):
             load_weights_fields = load_weights_fields,
             use_cond2dec=use_cond2dec,
             new_vocab= data.new_vocab,
-            ml_model_url=os.getenv('ML_MODEL_URL'))
+            ml_model_url=os.getenv('ML_MOLS_MODEL_APP_URL'))
     except Exception as e:
         print(e)
         state.gen_model_upd_status(case=data.case,error=str(e))
@@ -309,14 +309,14 @@ def gan_auto_generator(data:GenData=Body()):
 
     result['Validity'] = [validity] * valid_count
     result["Duplicates"] = [duplicates] * valid_count
-    # print(os.getenv('ML_MODEL_URL'))
+    # print(os.getenv('ML_MOLS_MODEL_APP_URL'))
     # try:
     #     if state(data.case_,'ml')['status'] == 'Trained':
-    #         ml_props = predict_smiles(valid_mols,data.case_,url=os.getenv('ML_MODEL_URL'))
+    #         ml_props = predict_smiles(valid_mols,data.case_,url=os.getenv('ML_MOLS_MODEL_APP_URL'))
     #         for key,value in ml_props.items():
     #             props[key]=value
     # except:
-    #     ml_props = predict_smiles(valid_mols,'Base',url=os.getenv('ML_MODEL_URL'))
+    #     ml_props = predict_smiles(valid_mols,'Base',url=os.getenv('ML_MOLS_MODEL_APP_URL'))
     #     for key,value in ml_props.items():
     #         props[key]=value
     return result
