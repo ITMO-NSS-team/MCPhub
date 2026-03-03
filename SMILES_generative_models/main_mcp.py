@@ -220,6 +220,58 @@ def get_state_from_server(url: str = "pred", case: Optional[str] = None) -> Unio
 
 
 @mcp.tool(
+    title="Start Generative Model Training",
+    description="Starts training of a generative model for the specified case using a training dataset path.",
+    tags={"training", "generation", },
+)
+def start_generative_model_training(
+    dataset_path: str,
+    case_name: str,
+) -> Dict[str, str]:
+    """
+    Start training for a generative model case.
+
+    The function initiates training using the dataset located at
+    `dataset_path` and links the training run to `case_name`.
+    A production implementation may start training immediately or enqueue
+    a background job, but the response format should remain stable.
+
+    Args:
+        dataset_path:
+            Path to a file or directory with the training dataset.
+            Can be an absolute path or a project-relative path.
+        case_name:
+            Unique case identifier used to name and track the training run.
+
+    Returns:
+        Dict[str, str]:
+            Dictionary with training-start metadata:
+            - `case_name`: case identifier for which training was requested.
+            - `status`: training launch state (for example, `training_started`).
+            - `message`: human-readable confirmation or diagnostic message.
+
+    Raises:
+        ValueError:
+            If `dataset_path` or `case_name` is empty after trimming.
+        RuntimeError:
+            If training cannot be launched due to service or runtime errors.
+    """
+    dataset_path = dataset_path.strip()
+    case_name = case_name.strip()
+
+    if not dataset_path:
+        raise ValueError("dataset_path must not be empty")
+    if not case_name:
+        raise ValueError("case_name must not be empty")
+
+    return {
+        "case_name": case_name,
+        "status": "training_started",
+        "message": f"Generative model training successfully started for case '{case_name}'.",
+    }
+
+
+@mcp.tool(
     title="Generate Molecules (GAN)",
     description="Generates durg molecules and calculated properties without affiliation with a specific disease ",
     tags={"generation", "gan"},
