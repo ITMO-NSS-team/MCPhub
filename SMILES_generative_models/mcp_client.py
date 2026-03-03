@@ -21,7 +21,7 @@ async def main():
         prompts = await client.list_prompts()
         print(tools,resources,prompts)
         # Execute operations
-        result = await client.call_tool("generate_alzheimer_mols", {"num":2})
+        result = await client.call_tool("get_state_from_server", {})
         print(result)
 
 asyncio.run(main())

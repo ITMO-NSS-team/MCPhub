@@ -71,4 +71,4 @@ ENV GEN_APP_PORT=$GEN_APP_PORT
 ENV MCP_PORT=$MCP_PORT
 # Запуск
 RUN chmod +x /projects/generative_models/api.sh
-#ENTRYPOINT ["/bin/bash", "/projects/generative_models/api.sh"]
+ENTRYPOINT ["/bin/bash", "/projects/generative_models/api.sh"]
