@@ -64,6 +64,15 @@ CASE_GENERATED_PROPERTIES = [
     "KI",
 ]
 
+CASE_ENDPOINTS: Dict[str, str] = {
+    "skleroz": "search_Skleroz",
+    "parkinson": "search_Parkinson",
+    "cancer": "search_Canser",
+    "dyslipidemia": "search_Dyslipidemia",
+    "drug_resist": "search_Drug_resist",
+    "alzheimer": "search_Alzheimer",
+}
+
 
 def _resolve_base_url(selector: str) -> str:
     key = (selector or "").strip().lower()
@@ -136,14 +145,10 @@ def _post_generation_request(
     return data
 
 
-@mcp.tool(
-    title="Get Server State",
-    description="Returns model registry state from prediction or generative API server.",
-    tags={"state", "metadata"},
-)
+@mcp.tool()
 def get_state_from_server(url: str = "pred", case: Optional[str] = None) -> Union[dict, str]:
     """
-    Fetch model registry state from the prediction or generative API server.
+    Returns model registry state from prediction or generative API server.
 
     Args:
         url:
@@ -179,11 +184,7 @@ def get_state_from_server(url: str = "pred", case: Optional[str] = None) -> Unio
     return state
 
 
-# @mcp.tool(
-#     title="Predict Properties by SMILES",
-#     description="Calls /predict_ml for batch property prediction.",
-#     tags={"prediction", "ml"},
-# )
+# @mcp.tool()
 # def predict_prop_by_smiles(
 #     smiles_list: List[str],
 #     case: str = "no_name_case",
@@ -219,17 +220,13 @@ def get_state_from_server(url: str = "pred", case: Optional[str] = None) -> Unio
 #     )
 
 
-@mcp.tool(
-    title="Start Generative Model Training",
-    description="Starts training of a generative model for the specified case using a training dataset path.",
-    tags={"training", "generation", },
-)
+@mcp.tool()
 def start_generative_model_training(
     dataset_path: str,
     case_name: str,
 ) -> Dict[str, str]:
     """
-    Start training for a generative model case.
+    Starts training of a generative model for the specified case using a training dataset path.
 
     The function initiates training using the dataset located at
     `dataset_path` and links the training run to `case_name`.
@@ -271,17 +268,12 @@ def start_generative_model_training(
     }
 
 
-@mcp.tool(
-    title="Generate Molecules (GAN)",
-    description="Generates durg molecules and calculated properties without affiliation with a specific disease ",
-    tags={"generation", "gan"},
-)
+@mcp.tool()
 def generate_mols(
-    num: int = 10,
-    case: str = "Alzheimer",
+    num: int = 10
 ) -> Dict[str, Any]:
     """
-    Generate molecules with GAN without affiliation with a specific disease .
+    Generates drug molecules and calculated properties without affiliation with a specific disease.
 
     Args:
         num:
@@ -305,23 +297,30 @@ def generate_mols(
         RuntimeError:
             If generative endpoint is unavailable or returns invalid response format.
     """
-    return _post_generation_request("gan_case_generator", numb_mol=num, case=case)
+    return _post_generation_request("gan_case_generator", numb_mol=num)
 
 
 def _generate_case_mols(endpoint: str, num: int) -> Dict[str, Any]:
     return _post_generation_request(endpoint, numb_mol=num)
 
 
-@mcp.tool(
-    title="Generate Molecules for Skleroz",
-    description="Generate molecules for multiple sclerosis (Skleroz).",
-    tags={"generation", "disease", "skleroz"},
-)
-def generate_skleroz_mols(num: int = 10) -> Dict[str, Any]:
+@mcp.tool()
+def generate_case_mols(case: str, num: int = 10) -> Dict[str, Any]:
     """
-    Generate molecules for multiple sclerosis (Skleroz).
+    Generate molecules for a selected disease case using case-specific generator.
+
+    Supported cases: `skleroz`, `parkinson`, `cancer`, `dyslipidemia`, `drug_resist`, `alzheimer`.
 
     Args:
+        case:
+            Disease case selector (case-insensitive).
+            Supported values:
+            - `skleroz` -> multiple sclerosis endpoint.
+            - `parkinson` -> Parkinson's disease endpoint.
+            - `cancer` -> cancer endpoint.
+            - `dyslipidemia` -> dyslipidemia endpoint.
+            - `drug_resist` -> drug-resistance endpoint.
+            - `alzheimer` -> Alzheimer's disease endpoint.
         num:
             Number of molecules requested.
             Default: `10`.
@@ -332,140 +331,18 @@ def generate_skleroz_mols(num: int = 10) -> Dict[str, Any]:
             Case generator output with aligned lists.
             Typical keys: `Molecules`, `QED`, `Synthetic Accessibility`, `PAINS`,
             `SureChEMBL`, `Glaxo`, `Brenk`, `BBB`.
-            Optional keys: `IC50`, `KI`, and anti-target docking columns
-            (`Anti Docking score for <target>`).
+            Optional keys: `IC50`, `KI`,.
+
+    Raises:
+        ValueError:
+            If case is not supported.
     """
-    return _generate_case_mols("search_Skleroz", num)
-
-
-@mcp.tool(
-    title="Generate Molecules for Parkinson",
-    description="Generate molecules for Parkinson's disease.",
-    tags={"generation", "disease", "parkinson"},
-)
-def generate_parkinson_mols(num: int = 10) -> Dict[str, Any]:
-    """
-    Generate molecules for Parkinson's disease.
-
-    Args:
-        num:
-            Number of molecules requested.
-            Default: `10`.
-            Endpoint internally caps requests above `100`.
-
-    Returns:
-        Dict[str, list]:
-            Case generator output with aligned lists.
-            Typical keys: `Molecules`, `QED`, `Synthetic Accessibility`, `PAINS`,
-            `SureChEMBL`, `Glaxo`, `Brenk`, `BBB`.
-            Optional keys: `IC50`, `KI`, and anti-target docking columns
-            (`Anti Docking score for <target>`).
-    """
-    return _generate_case_mols("search_Parkinson", num)
-
-
-@mcp.tool(
-    title="Generate Molecules for Cancer",
-    description="Generate molecules for cancer case.",
-    tags={"generation", "disease", "cancer"},
-)
-def generate_cancer_mols(num: int = 10) -> Dict[str, Any]:
-    """
-    Generate molecules for cancer.
-
-    Args:
-        num:
-            Number of molecules requested.
-            Default: `10`.
-            Endpoint internally caps requests above `100`.
-
-    Returns:
-        Dict[str, list]:
-            Case generator output with aligned lists.
-            Typical keys: `Molecules`, `QED`, `Synthetic Accessibility`, `PAINS`,
-            `SureChEMBL`, `Glaxo`, `Brenk`, `BBB`.
-            Optional keys: `IC50`, `KI`, and anti-target docking columns
-            (`Anti Docking score for <target>`).
-    """
-    return _generate_case_mols("search_Canser", num)
-
-
-@mcp.tool(
-    title="Generate Molecules for Dyslipidemia",
-    description="Generate molecules for dyslipidemia.",
-    tags={"generation", "disease", "dyslipidemia"},
-)
-def generate_dyslipidemia_mols(num: int = 10) -> Dict[str, Any]:
-    """
-    Generate molecules for dyslipidemia.
-
-    Args:
-        num:
-            Number of molecules requested.
-            Default: `10`.
-            Endpoint internally caps requests above `100`.
-
-    Returns:
-        Dict[str, list]:
-            Case generator output with aligned lists.
-            Typical keys: `Molecules`, `QED`, `Synthetic Accessibility`, `PAINS`,
-            `SureChEMBL`, `Glaxo`, `Brenk`, `BBB`.
-            Optional keys: `IC50`, `KI`, and anti-target docking columns
-            (`Anti Docking score for <target>`).
-    """
-    return _generate_case_mols("search_Dyslipidemia", num)
-
-
-@mcp.tool(
-    title="Generate Molecules for Drug Resistance",
-    description="Generate molecules for drug resistance case.",
-    tags={"generation", "disease", "drug_resistance"},
-)
-def generate_drug_resist_mols(num: int = 10) -> Dict[str, Any]:
-    """
-    Generate molecules for drug resistance.
-
-    Args:
-        num:
-            Number of molecules requested.
-            Default: `10`.
-            Endpoint internally caps requests above `100`.
-
-    Returns:
-        Dict[str, list]:
-            Case generator output with aligned lists.
-            Typical keys: `Molecules`, `QED`, `Synthetic Accessibility`, `PAINS`,
-            `SureChEMBL`, `Glaxo`, `Brenk`, `BBB`.
-            Optional keys: `IC50`, `KI`, and anti-target docking columns
-            (`Anti Docking score for <target>`).
-    """
-    return _generate_case_mols("search_Drug_resist", num)
-
-
-@mcp.tool(
-    title="Generate Molecules for Alzheimer",
-    description="Generate molecules for Alzheimer's disease.",
-    tags={"generation", "disease", "alzheimer"},
-)
-def generate_alzheimer_mols(num: int = 10) -> Dict[str, Any]:
-    """
-    Generate molecules for Alzheimer.
-
-    Args:
-        num:
-            Number of molecules requested.
-            Default: `10`.
-            Endpoint internally caps requests above `100`.
-
-    Returns:
-        Dict[str, list]:
-            Case generator output with aligned lists.
-            Typical keys: `Molecules`, `QED`, `Synthetic Accessibility`, `PAINS`,
-            `SureChEMBL`, `Glaxo`, `Brenk`, `BBB`.
-            Optional keys: `IC50`, `KI`, and anti-target docking columns
-            (`Anti Docking score for <target>`).
-    """
-    return _generate_case_mols("search_Alzheimer", num)
+    case_key = (case or "").strip().lower()
+    endpoint = CASE_ENDPOINTS.get(case_key)
+    if endpoint is None:
+        supported = ", ".join(sorted(CASE_ENDPOINTS.keys()))
+        raise ValueError(f"Unsupported case '{case}'. Supported cases: {supported}")
+    return _generate_case_mols(endpoint, num)
 
 
 if __name__ == "__main__":

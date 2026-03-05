@@ -87,7 +87,7 @@ def _normalize_prop_values(values, expected_size: int) -> list:
 class GenData(BaseModel):
         numb_mol: int =1
         model:str = None
-        cuda:bool=False
+        cuda:bool=True
         mean_:float=0
         std_:float=1
         case_ : str = 'RNMD'
