@@ -8,6 +8,11 @@ ARG GITHUB_TOKEN
 ARG GEN_MOLS_MODEL_APP_PORT
 ARG ML_MOLS_MODEL_APP_URL
 ARG MOLS_GEN_MCP_PORT
+ARG S3_ENDPOINT_URL
+ARG S3_ACCESS_KEY
+ARG S3_SECRET_KEY
+ARG S3_BUCKET_NAME="molecule-generative-mcp"
+
 
 # Установка базовых зависимостей
 RUN apt-get update && apt-get install --no-install-recommends -y \
@@ -69,6 +74,12 @@ ENV PYTHONPATH="/projects/CoScientist/:$PYTHONPATH"
 ENV PYTHONPATH="/projects/:$PYTHONPATH"
 ENV GEN_MOLS_MODEL_APP_PORT=$GEN_MOLS_MODEL_APP_PORT
 ENV MOLS_GEN_MCP_PORT=$MOLS_GEN_MCP_PORT
+ENV ENDPOINT_URL=$S3_ENDPOINT_URL
+ENV ACCESS_KEY=$S3_ACCESS_KEY
+ENV SECRET_KEY=$S3_SECRET_KEY
+ENV BUCKET_NAME=$S3_BUCKET_NAME
+
 # Запуск
 RUN chmod +x /projects/generative_models/api.sh
 ENTRYPOINT ["/bin/bash", "/projects/generative_models/api.sh"]
+

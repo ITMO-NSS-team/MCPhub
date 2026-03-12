@@ -7,7 +7,7 @@ import_path = str(repo_root)
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-from autotrain.utils.read_state import TrainState
+from autotrain.utils.base_state import TrainState
 from train_data.utils.auto_train_loop import train_model
 from train_data.utils.config import configurate_parser
 from Models import get_model

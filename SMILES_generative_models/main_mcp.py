@@ -2,7 +2,7 @@
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import requests
 from dotenv import load_dotenv
@@ -118,6 +118,80 @@ def _gan_http_timeout() -> int:
     return int(os.getenv("GAN_HTTP_TIMEOUT_S", "1160"))
 
 
+def _normalize_s3_prefix(prefix: str) -> str:
+    normalized = (prefix or "").replace("\\", "/").strip("/")
+    return f"{normalized}/" if normalized else ""
+
+
+def _normalize_s3_extension(extension: str) -> str:
+    if extension is None:
+        return ""
+    normalized = extension.strip()
+    if not normalized:
+        return ""
+    return normalized if normalized.startswith(".") else f".{normalized}"
+
+
+def _build_s3_service(
+    *,
+    endpoint_url: Optional[str] = None,
+    access_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    bucket_name: Optional[str] = None,
+):
+    try:
+        from train_data.utils.s3_utils import S3BucketService, s3_service as default_s3_service
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "S3 dependencies are missing. Install boto3 (for example via requirements.txt / requirements.mcp.txt)."
+        ) from exc
+
+    endpoint = endpoint_url or os.getenv("ENDPOINT_URL") or default_s3_service.endpoint
+    access = access_key or os.getenv("ACCESS_KEY") or default_s3_service.access_key
+    secret = secret_key or os.getenv("SECRET_KEY") or default_s3_service.secret_key
+    bucket = bucket_name or os.getenv("BUCKET_NAME") or default_s3_service.bucket_name
+
+    if not endpoint:
+        raise ValueError("S3 endpoint is empty. Set `ENDPOINT_URL` or pass `endpoint_url`.")
+    if not access:
+        raise ValueError("S3 access key is empty. Set `ACCESS_KEY` or pass `access_key`.")
+    if not secret:
+        raise ValueError("S3 secret key is empty. Set `SECRET_KEY` or pass `secret_key`.")
+    if not bucket:
+        raise ValueError("S3 bucket name is empty. Set `BUCKET_NAME` or pass `bucket_name`.")
+
+    return S3BucketService(
+        endpoint=endpoint,
+        access_key=access,
+        secret_key=secret,
+        bucket_name=bucket,
+    )
+
+
+def _extract_case_name_from_s3_key(s3_key: str, *, prefix: str, extension: str) -> Optional[str]:
+    normalized_key = (s3_key or "").replace("\\", "/").strip("/")
+    normalized_prefix = _normalize_s3_prefix(prefix)
+    normalized_extension = _normalize_s3_extension(extension).lower()
+
+    if normalized_prefix and not normalized_key.startswith(normalized_prefix):
+        return None
+
+    relative_key = normalized_key[len(normalized_prefix) :] if normalized_prefix else normalized_key
+    if not relative_key or relative_key.endswith("/"):
+        return None
+
+    # `start_generative_model_training` expects key format: train/{case_name}.csv
+    if "/" in relative_key:
+        return None
+
+    if normalized_extension:
+        if not relative_key.lower().endswith(normalized_extension):
+            return None
+        return relative_key[: -len(normalized_extension)]
+
+    return relative_key
+
+
 def _validate_numb_mol(numb_mol: int) -> int:
     if int(numb_mol) < 1:
         raise ValueError("numb_mol must be >= 1")
@@ -146,9 +220,84 @@ def _post_generation_request(
 
 
 @mcp.tool()
-def get_state_from_server(url: str = "pred", case: Optional[str] = None) -> Union[dict, str]:
+def list_s3_train_cases(
+    prefix: str = "train/",
+    extension: str = ".csv",
+) -> Dict[str, Any]:
+    """
+    Lists S3 objects and resolves dataset names (`case_name`) for MCP training workflows.
+
+    Main purpose:
+        Find training dataset files for the MCP server of generative and predictive molecular models.
+        By default, this tool searches inside `train/` because `start_generative_model_training`
+        expects datasets at `train/{case_name}.csv`.
+
+    Prefix behavior:
+        - Default (`prefix="train/"`): standard mode for training dataset discovery.
+        - Global search (`prefix=""`): lists all objects in the bucket.
+          This can be useful to inspect bucket structure (for example, understand available
+          folders first), and then run a narrower search for train files.
+
+    Args:
+        prefix:
+            S3 prefix (folder) where train datasets are stored.
+            Default: `train/`.
+        extension:
+            File extension for train datasets.
+            Default: `.csv`.
+
+    Returns:
+        Dict[str, Any]:
+            - `bucket_name`: resolved bucket name.
+            - `prefix`: normalized prefix used for listing.
+            - `extension`: normalized extension filter.
+            - `total_train_files`: count of files matching expected train format.
+            - `s3_keys`: matching S3 object keys.
+            - `case_names`: normalized case names (without prefix and extension) for `case_name`.
+    """
+    s3_service = _build_s3_service()
+
+    normalized_prefix = _normalize_s3_prefix(prefix)
+    normalized_extension = _normalize_s3_extension(extension)
+    keys = s3_service.list_objects(prefix=normalized_prefix)
+
+    filtered_keys: List[str] = []
+    case_names: List[str] = []
+    seen_cases: Set[str] = set()
+
+    for key in keys:
+        case_name = _extract_case_name_from_s3_key(
+            key,
+            prefix=normalized_prefix,
+            extension=normalized_extension,
+        )
+        if not case_name:
+            continue
+
+        normalized_key = key.replace("\\", "/").strip("/")
+        filtered_keys.append(normalized_key)
+        if case_name not in seen_cases:
+            seen_cases.add(case_name)
+            case_names.append(case_name)
+
+    filtered_keys.sort()
+    case_names.sort()
+
+    return {
+        "bucket_name": s3_service.bucket_name,
+        "prefix": normalized_prefix,
+        "total_train_files": len(filtered_keys),
+        "s3_keys": filtered_keys,
+        "case_names": case_names
+       
+    }
+
+
+@mcp.tool()
+def get_state_from_server(url: str = "gen", case: Optional[str] = None) -> Union[dict, str]:
     """
     Returns model registry state from prediction or generative API server.
+    This state discribes available cases, their training status, and metadata. It is used by MCP clients to discover cases and track training progress.
 
     Args:
         url:
@@ -184,101 +333,92 @@ def get_state_from_server(url: str = "pred", case: Optional[str] = None) -> Unio
     return state
 
 
-# @mcp.tool()
-# def predict_prop_by_smiles(
-#     smiles_list: List[str],
-#     case: str = "no_name_case",
-#     timeout: int = 20,
-# ) -> dict:
-#     """
-#     Predict molecular properties for a batch of SMILES strings.
-
-#     Args:
-#         smiles_list:
-#             List of SMILES strings to evaluate.
-#         case:
-#             Prediction case/model name known by `/predict_ml`.
-#             Use `get_state_from_server(url="pred")` to inspect available cases.
-#         timeout:
-#             Timeout in minutes for server-side processing.
-
-#     Returns:
-#         dict:
-#             Raw JSON returned by `POST /predict_ml` (property names and
-#             predictions are server-defined).
-
-#     Raises:
-#         RuntimeError:
-#             If request fails, times out, or server returns HTTP >= 400.
-#     """
-#     params = {"case": case, "smiles_list": smiles_list, "timeout": timeout}
-#     return _request_json(
-#         "POST",
-#         f"{PRED_BASE_URL}/predict_ml",
-#         json=params,
-#         timeout_s=_predict_http_timeout(timeout),
-#     )
-
 
 @mcp.tool()
 def start_generative_model_training(
-    dataset_path: str,
     case_name: str,
-) -> Dict[str, str]:
+    feature_column:  List[str] = ["Smiles"],
+    epochs: int = 10,
+    fine_tune: bool = True
+) -> Dict[str, Any]:
     """
-    Starts training of a generative model for the specified case using a training dataset path.
-
-    The function initiates training using the dataset located at
-    `dataset_path` and links the training run to `case_name`.
-    A production implementation may start training immediately or enqueue
-    a background job, but the response format should remain stable.
+    Starts GAN generative training with existing train dataset in s3 database for a specific case.
 
     Args:
-        dataset_path:
-            Path to a file or directory with the training dataset.
-            Can be an absolute path or a project-relative path.
         case_name:
-            Unique case identifier used to name and track the training run.
-
+            Unique case identifier used to name and track the training run. It is the same name with existing train dataset in s3 database.
+            Use `list_s3_train_cases` to get available values. Example: `Alzhmr`.
+        feature_column:
+            list with name of feature column in downloaded CSV.
+            Example: `["Smiles"]`.
+        epochs:
+            Number of GAN training steps/epochs passed to server.
+        fine_tune:
+            Whether to fine-tune existing GAN weights.
+        
     Returns:
-        Dict[str, str]:
-            Dictionary with training-start metadata:
-            - `case_name`: case identifier for which training was requested.
-            - `status`: training launch state (for example, `training_started`).
-            - `message`: human-readable confirmation or diagnostic message.
+        Dict[str, Any]:
+            Metadata about submitted training request and server response.
 
     Raises:
         ValueError:
-            If `dataset_path` or `case_name` is empty after trimming.
+            If required fields are empty.
         RuntimeError:
-            If training cannot be launched due to service or runtime errors.
+            If request to training service fails.
     """
-    dataset_path = dataset_path.strip()
     case_name = case_name.strip()
+    s3_key = f'train/{case_name}.csv'
 
-    if not dataset_path:
-        raise ValueError("dataset_path must not be empty")
     if not case_name:
         raise ValueError("case_name must not be empty")
+    if not s3_key:
+        raise ValueError("s3_key must not be empty")
+    if int(epochs) < 1:
+        raise ValueError("epochs must be >= 1")
 
-    return {
+
+    payload: Dict[str, Any] = {
+        "case": case_name,
+        "s3_key": s3_key,
+        "feature_column": feature_column,
+        "epochs": int(epochs),
+        "fine_tune": bool(fine_tune),
+    }
+
+    response = _request_json(
+        "POST",
+        f"{GEN_BASE_URL}/train_gan",
+        json=payload,
+        timeout_s=_gan_http_timeout(),
+    )
+
+    result: Dict[str, Any] = {
         "case_name": case_name,
         "status": "training_started",
-        "message": f"Generative model training successfully started for case '{case_name}'.",
+        "message": f"GAN training request sent for case '{case_name}'.",
+        "s3_key": s3_key,
+        "endpoint": f"{GEN_BASE_URL}/train_gan",
     }
+    if response is not None:
+        result["server_response"] = response
+    return result
 
 
 @mcp.tool()
 def generate_mols(
-    num: int = 10
+    num: int = 10,
+    case: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Generates drug molecules and calculated properties without affiliation with a specific disease.
-
+    Generates drug molecules and calculated properties. It uses GAN-based generator that generate molecules fast without case specific training.
+    But if you want to generate molecules from specific TRAINED case, you can use `case` parameter. In that case, it will use case-specific generator, that can generate molecules with properties similar to the ones in training data of that case.
     Args:
         num:
             Number of molecules requested.
             Default 10.
+        case:
+            Optional trained GAN case name. Used to generate molecules from that case by model, that trainded before.
+            If omitted, server default case behavior is used.
 
     Returns:
         Dict[str, list]:
@@ -297,7 +437,10 @@ def generate_mols(
         RuntimeError:
             If generative endpoint is unavailable or returns invalid response format.
     """
-    return _post_generation_request("gan_case_generator", numb_mol=num)
+    normalized_case = case.strip() if isinstance(case, str) else None
+    if normalized_case == "":
+        normalized_case = None
+    return _post_generation_request("gan_case_generator", numb_mol=num, case=normalized_case)
 
 
 def _generate_case_mols(endpoint: str, num: int) -> Dict[str, Any]:

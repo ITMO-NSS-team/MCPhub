@@ -101,7 +101,7 @@ def train_ml_with_data(data:MLData=Body()):
                          timeout=data.timeout)
         
 if __name__ == "__main__":
-    state = TrainState(state_path='train_data/utils/state.json')
+    state = TrainState(state_path='autotrain/utils/state.json')
     CASE = 'Dslpdm'
     train_data = 'docked_data_for_train/data_5vfi.csv'
     conditions = ['docking_score','QED','Synthetic Accessibility','PAINS','SureChEMBL','Glaxo','Brenk','IC50']

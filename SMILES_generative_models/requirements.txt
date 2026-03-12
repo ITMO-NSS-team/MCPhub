@@ -29,3 +29,7 @@ bio
 huggingface_hub
 catboost
 dotenv
+boto3==1.28.12
+botocore==1.31.12
+pyOpenSSL==23.2.0
+cryptography==41.0.7

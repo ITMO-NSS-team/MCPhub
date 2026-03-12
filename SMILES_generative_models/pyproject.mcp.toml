@@ -11,4 +11,5 @@ dependencies = [
   "openpyxl",
   "pyarrow",
   "uvicorn",
+  "boto3",
 ]

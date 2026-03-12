@@ -9,3 +9,4 @@ lightgbm
 bio
 fastmcp
 huggingface_hub
+boto3

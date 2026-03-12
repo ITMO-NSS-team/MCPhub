@@ -11,6 +11,7 @@ sys.path.append(import_path)
 from GAN.gan_lstm_refactoring.gen import generate
 from generate.config import parsing
 from train_data.utils.config_generate import configurate_parser
+from train_data.utils.s3_utils import S3BucketService
 from train_data.generate import generator_for_agent_multi_prop as multi_generator
 import pandas as pd
 from utils.validation import check_chem_valid, eval_P_S_G, eval_qed, eval_sa, check_brenk
@@ -112,6 +113,24 @@ class TrainData(BaseModel):
         # regression_props:list= None
         # classification_props:list = None
 
+class TrainDataS3(BaseModel):
+        case:str = None
+        endpoint_url:str = os.getenv("ENDPOINT_URL")
+        access_key:str = os.getenv("ACCESS_KEY")
+        secret_key:str = os.getenv("SECRET_KEY")
+        bucket_name:str = os.getenv("BUCKET_NAME")
+        s3_key:str = None
+        data_path:str = None
+        feature_column:list = ['Smiles']
+        # Backward compatibility with common typo/casing in clients.
+        Future_column:list = None
+        future_column:list = None
+        fine_tune:bool = True
+        epochs:int = 10
+        # Backward compatibility with previous payload names.
+        s3_bucket:str = None
+        s3_endpoint_url:str = None
+
 class Molecules(BaseModel):
     mol_list:List[str]
 
@@ -121,6 +140,124 @@ class Docking_config(BaseModel):
 
 def condition_enchance():
      pass
+
+
+def _resolve_feature_columns(data) -> list:
+    feature_column = data.feature_column
+    if data.Future_column is not None and (feature_column is None or feature_column == ['Smiles']):
+        feature_column = data.Future_column
+    if data.future_column is not None and (feature_column is None or feature_column == ['Smiles']):
+        feature_column = data.future_column
+
+    if isinstance(feature_column, str):
+        feature_column = [feature_column]
+    if not feature_column:
+        raise ValueError("`feature_column` (or `Future_column`) is required.")
+    return feature_column
+
+
+_SMILES_COLUMN_ALIASES = {
+    "smiles",
+    "smile",
+    "canonical_smiles",
+    "canonicalsmiles",
+    "smiles_canonical",
+    "molecule_smiles",
+    "moleculesmiles",
+    "molecules",
+    "molecule",
+    "mol",
+    "mol_smiles",
+    "structure",
+}
+
+
+def _normalize_column_name(column_name: str) -> str:
+    return "".join(ch for ch in str(column_name).strip().lower() if ch.isalnum())
+
+
+def _detect_smiles_feature_column(df: pd.DataFrame) -> str:
+    """
+    Detect SMILES column in a downloaded dataset.
+
+    Detection strategy:
+    1) Alias lookup by common column names.
+    2) Fallback heuristic based on RDKit-valid SMILES ratio in sample values.
+    """
+    if df is None or df.empty:
+        return None
+
+    columns = list(df.columns)
+    if not columns:
+        return None
+
+    # 1) Alias-based match (fast path).
+    alias_map = {_normalize_column_name(alias) for alias in _SMILES_COLUMN_ALIASES}
+    for col in columns:
+        normalized = _normalize_column_name(col)
+        if normalized in alias_map:
+            return col
+        if normalized.endswith("smiles") or normalized.startswith("smiles"):
+            return col
+
+    # 2) Heuristic by chemical validity for string-like columns.
+    best_column = None
+    best_score = 0.0
+    best_valid_count = -1
+    min_rows_for_eval = 10
+    sample_size = 200
+
+    for col in columns:
+        series = df[col]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+
+        values = series.dropna().astype(str).str.strip()
+        values = values[values != ""]
+        if values.empty:
+            continue
+
+        sample = values.head(sample_size).tolist()
+        if len(sample) < min_rows_for_eval:
+            continue
+
+        valid_count = len(check_chem_valid(sample))
+        score = valid_count / len(sample)
+
+        if score > best_score or (score == best_score and valid_count > best_valid_count):
+            best_column = col
+            best_score = score
+            best_valid_count = valid_count
+
+    # Conservative threshold to avoid selecting non-chemical text columns.
+    if best_column is not None and best_score >= 0.60:
+        return best_column
+    return None
+
+
+def _resolve_or_detect_feature_column(df: pd.DataFrame, requested_feature_column: list) -> list:
+    """
+    Resolve feature column from request; if not found, auto-detect SMILES column.
+    """
+    requested = requested_feature_column[0] if requested_feature_column else None
+
+    if requested in df.columns:
+        return [requested]
+
+    if requested is not None:
+        requested_norm = str(requested).strip().lower()
+        for col in df.columns:
+            if str(col).strip().lower() == requested_norm:
+                return [col]
+
+    detected = _detect_smiles_feature_column(df)
+    if detected is not None:
+        return [detected]
+
+    raise ValueError(
+        f"Feature column '{requested}' not found and auto-detection failed. "
+        f"Available columns: {df.columns.tolist()}"
+    )
 
 def case_trainer(data:TrainData=Body()):
     # #####FOR TEST####
@@ -255,6 +392,97 @@ def gan_case_trainer(data:TrainData=Body()):
     except Exception as e:
         print(e)
         state.gen_model_upd_status(case=data.case,error=str(e))
+
+def gan_case_trainer_s3(data:TrainDataS3=Body()):
+    # #####FOR TEST####
+    # if data.numb_mol>100:
+    #     data.numb_mol=100
+    # ##################
+    #Docking score
+    is_evalute_docking = False
+    """Copy of GAN trainer that downloads train dataset from S3 before fit."""
+    state = TrainState(state_path='autotrain/utils/state.json')
+    try:
+        if data.case is None:
+            raise ValueError("`case` is required.")
+        data.case = data.case.strip()
+        if not data.case:
+            raise ValueError("`case` must not be empty.")
+        if not data.s3_key:
+            raise ValueError("`s3_key` is required.")
+        feature_column = _resolve_feature_columns(data)
+
+        # Ensure case exists in state before any updates/status writes.
+        if state(data.case) is None:
+            state.add_new_case(case_name=data.case, rewrite=False)
+
+        if not data.data_path:
+            data.data_path = f"autotrain/data/{data.case}/data.csv"
+        data.data_path = data.data_path.replace("\\", "/")
+        local_dir = os.path.dirname(data.data_path)
+        if local_dir:
+            os.makedirs(local_dir, exist_ok=True)
+
+        endpoint_url = data.endpoint_url or data.s3_endpoint_url or os.getenv("ENDPOINT_URL")
+        access_key = data.access_key or os.getenv("ACCESS_KEY")
+        secret_key = data.secret_key or os.getenv("SECRET_KEY")
+        bucket_name = data.bucket_name or data.s3_bucket or os.getenv("BUCKET_NAME")
+
+        if not endpoint_url:
+            raise ValueError("S3 endpoint is empty. Set `endpoint_url` or env `ENDPOINT_URL`.")
+        if not access_key:
+            raise ValueError("S3 access key is empty. Set `access_key` or env `ACCESS_KEY`.")
+        if not secret_key:
+            raise ValueError("S3 secret key is empty. Set `secret_key` or env `SECRET_KEY`.")
+        if not bucket_name:
+            raise ValueError("S3 bucket is empty. Set `bucket_name` or env `BUCKET_NAME`.")
+
+        s3_service = S3BucketService(
+            endpoint=endpoint_url,
+            access_key=access_key,
+            secret_key=secret_key,
+            bucket_name=bucket_name
+        )
+        s3_service.download_image_from_s3(s3_key=data.s3_key, local_path=data.data_path)
+
+        # Keep behavior close to gan_case_trainer: sanitize and save local csv before training.
+        df = pd.read_csv(data.data_path).dropna()
+        requested_feature_name = None
+        if isinstance(data.feature_column, list) and data.feature_column:
+            requested_feature_name = data.feature_column[0]
+        elif isinstance(data.feature_column, str):
+            requested_feature_name = data.feature_column
+        feature_column = _resolve_or_detect_feature_column(df, feature_column)
+        if feature_column[0] != requested_feature_name:
+            print(
+                f"Auto-detected feature column for case '{data.case}': "
+                f"'{feature_column[0]}' (requested: '{requested_feature_name}')"
+            )
+        df.to_csv(data.data_path, index=False)
+        state.gen_model_upd_data(
+            case=data.case,
+            data_path=data.data_path,
+            feature_column=feature_column
+        )
+
+        # if state(data.case,'ml') is None:
+        #     print(f"{data.case} is not exist! Train ML model before")
+        #     state.gen_model_upd_status(case=data.case,status=3)
+        #     return 0
+
+        auto_train(
+            data.case,
+            path_ds=data.data_path,
+            fine_tune=data.fine_tune,
+            state=state,
+            feature_column=feature_column,
+            steps=data.epochs
+        )
+
+    except Exception as e:
+        print(e)
+        if getattr(data, "case", None) and state(data.case) is not None:
+            state.gen_model_upd_status(case=data.case,error=str(e))
 
 def gan_auto_generator(data:GenData=Body()):
     state = TrainState(state_path='autotrain/utils/state.json')
