@@ -61,14 +61,9 @@ def auto_train(case,state,path_ds: str, lr: float = 0.0003, bs: int = 256, steps
         os.mkdir(f'autotrain/GAN_weights/train_GAN_{case}')
     # save model
     pi.dump(gan_mol, open(f'autotrain/GAN_weights/train_GAN_{case}/gan_weights.pkl', 'wb'))
-    api = HfApi(token=os.getenv("HF_TOKEN"))
     state.gen_model_upd_status(case=case,model_weight_path=f'autotrain/GAN_weights/train_GAN_{case}',status=2)
-    api.upload_file(
-    path_or_fileobj="autotrain/utils/state.json",
-    repo_id="SoloWayG/Molecule_transformer",
-    repo_type="model",
-    path_in_repo = 'state.json'
-)   
+    state.sync_state_to_s3()
+    api = HfApi(token=os.getenv("HF_TOKEN"))
     api.upload_folder(repo_id='SoloWayG/Molecule_transformer',
                               folder_path=f'autotrain/GAN_weights',
                               path_in_repo=f'GAN_weights',

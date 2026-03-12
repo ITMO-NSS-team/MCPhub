@@ -4,3 +4,4 @@ pandas
 openpyxl
 pyarrow
 uvicorn
+boto3

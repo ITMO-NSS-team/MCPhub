@@ -94,6 +94,10 @@ def train_ml(data: dict[str, Any]) -> dict[str, Any]:
             - `target_column` (list[str]): columns to predict.
             - `regression_props` / `classification_props` (list[str] | optional):
               target properties per task type.
+            - `s3_key` (str | optional): key/path to CSV in S3. If provided, dataset
+              is downloaded before training.
+            - `endpoint_url`, `access_key`, `secret_key`, `bucket_name`
+              (str | optional): S3 connection settings; env fallbacks are supported.
             - `timeout` (int): training timeout in minutes.
             - `description` (str): case description.
             - `save_trained_data_to_sync_server` (bool): optional sync flag.

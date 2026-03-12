@@ -1,8 +1,9 @@
 import json
-from typing import Union,List
+from typing import List
 from pydantic import BaseModel
 import os
 from autotrain.utils.calculateble_prop_funcs import config
+from autotrain.utils.state_s3 import download_state_file, upload_state_file
 
 
 class BaseState(BaseModel):
@@ -27,15 +28,24 @@ class TrainState:
     """
     defult_parameters = BaseState()
 
-    def __init__(self,state_path:str=None):
+    def __init__(self, state_path: str = None, sync_with_s3: bool = True, state_s3_key: str = None):
         self.state_path = state_path
-        if state_path is not None:
-            self.current_state = self.__load_state()
-        elif os.path.isfile("automl/state/state.json"):
-            self.state_path = "automl/state/state.json"
+        self.sync_with_s3 = sync_with_s3
+        self.state_s3_key = state_s3_key or os.getenv("STATE_S3_KEY") or "state/state.json"
+
+        if self.state_path is None:
+            self.state_path = r'autotrain/utils/state.json'
+
+        state_dir = os.path.dirname(self.state_path)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+
+        if self.sync_with_s3:
+            self.sync_state_from_s3(raise_on_error=False)
+
+        if os.path.isfile(self.state_path):
             self.current_state = self.__load_state()
         else:
-            self.state_path = r'automl/state/state.json'
             self.current_state = {"Calculateble properties" : config}
             self.__save_state()
 
@@ -211,23 +221,50 @@ class TrainState:
         return self.current_state["Calculateble properties"].keys()
 
     @staticmethod
-    def load_state(path:str = r'automl/state.json'):
-        state = json.load(open(path))
+    def load_state(path:str = r'autotrain/utils/state.json'):
+        with open(path) as state_file:
+            state = json.load(state_file)
         state["Calculateble properties"] = config
         return state
     
-    def save(self,path:str = r'automl/state.json'):
-        saving_dict = self.current_state.copy()
-        del saving_dict["Calculateble properties"]
-        json.dump(self.current_state, open(saving_dict, 'w' ) )
+    def save(self,path:str = r'autotrain/utils/state.json'):
+        self.state_path = path
+        self.__save_state()
+
+    def sync_state_from_s3(self, raise_on_error: bool = True) -> bool:
+        if not self.sync_with_s3:
+            return False
+        try:
+            download_state_file(local_path=self.state_path, state_s3_key=self.state_s3_key)
+            return True
+        except Exception as exc:
+            if raise_on_error:
+                raise
+            print(f"Failed to download state from S3: {exc}")
+            return False
+
+    def sync_state_to_s3(self, raise_on_error: bool = False) -> bool:
+        if not self.sync_with_s3:
+            return False
+        try:
+            upload_state_file(local_path=self.state_path, state_s3_key=self.state_s3_key)
+            return True
+        except Exception as exc:
+            if raise_on_error:
+                raise
+            print(f"Failed to upload state to S3: {exc}")
+            return False
 
     def __save_state(self):
         saving_dict = self.current_state.copy()
         del saving_dict["Calculateble properties"]
-        json.dump(saving_dict, open(self.state_path, 'w' ) )
+        with open(self.state_path, 'w') as state_file:
+            json.dump(saving_dict, state_file)
+        self.sync_state_to_s3(raise_on_error=False)
 
     def __load_state(self):
-        state = json.load(open(self.state_path))
+        with open(self.state_path) as state_file:
+            state = json.load(state_file)
         state["Calculateble properties"] = config
         return state
     

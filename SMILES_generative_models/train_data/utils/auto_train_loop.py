@@ -9,7 +9,6 @@ from Process import *
 from Batch import create_masks
 from inference import validate_docking, validate_props
 import warnings
-from huggingface_hub import HfApi
 warnings.filterwarnings('ignore')
 import torch.nn.functional as F
 #from generative_models.transformer.Optim import CosineWithRestarts
@@ -320,19 +319,7 @@ def train_model_auto(model : nn.Module,opt,state,case='Alzmhr'):
             torch.save(model.state_dict(), f'{opt.save_folder_name}/weights/epo{epoch+1}/model_weights')
             torch.save(model.state_dict(), f'{opt.save_folder_name}/weights/model_weights')
         
-        api = HfApi(token=os.getenv("HF_TOKEN"))
-        api.upload_file(
-            path_or_fileobj="autotrain/utils/state.json",
-            repo_id="SoloWayG/Molecule_transformer",
-            repo_type="model",
-            path_in_repo = 'state.json'
-        )
+        state.sync_state_to_s3()
     state.gen_model_upd_status(case=case,model_weight_path=f'{opt.save_folder_name}/weights',status=2)
     time.sleep(4)
-    api = HfApi(token=os.getenv("HF_TOKEN"))
-    api.upload_file(
-        path_or_fileobj="autotrain/utils/state.json",
-        repo_id="SoloWayG/Molecule_transformer",
-        repo_type="model",
-        path_in_repo = 'state.json'
-    )       
+    state.sync_state_to_s3()

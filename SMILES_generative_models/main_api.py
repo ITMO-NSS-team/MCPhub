@@ -16,8 +16,8 @@ import pandas as pd
 import threading
 import pickle as pi
 import lightgbm
-from huggingface_hub import hf_hub_download,snapshot_download
 from dotenv import load_dotenv
+from autotrain.utils.state_s3 import download_state_file
 load_dotenv()
 ###Docking
 from autodock_vina_python3.src.docking_score import docking_list
@@ -30,13 +30,15 @@ with open("config.yaml", "r") as file:
 
 is_public_API = config['is_public_API']
 local_dir = 'autotrain/utils'
+
+
+def sync_state_from_s3():
+    state_path = os.path.join(local_dir, "state.json")
+    download_state_file(local_path=state_path)
+    return state_path
+
+
 if __name__=='__main__':
-    # if not os.path.isdir('many_prop_CVAE'):
-    #     snapshot_download(repo_id="SoloWayG/Molecule_transformer",
-    #             allow_patterns ="many_prop_CVAE/*",
-    #             local_dir='infrastructure/generative_models',
-    #             force_download=True,
-    #             token=os.getenv("HF_TOKEN"))
     def get_ip():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0)
@@ -194,48 +196,23 @@ if __name__=='__main__':
 
     @app.post("/gan_case_generator")
     def case_run(data:GenData=Body()):
-        # hf_hub_download(repo_id="SoloWayG/Molecule_transformer",
-        #                  filename="state.json",
-        #                  local_dir=local_dir,
-        #                  force_download=True,
-        #                  token=os.getenv("HF_TOKEN"))
-        # snapshot_download(repo_id="SoloWayG/Molecule_transformer",
-        #             allow_patterns =["GAN_weights/*", "many_prop_CVAE/*"],
-        #             local_dir='autotrain/',
-        #             force_download=True,
-        #             token=os.getenv("HF_TOKEN"))
         return json.dumps(gan_auto_generator(data))
     
     @app.post("/train_gen_models")
     def case_run(data:TrainData=Body()):
-        
-        hf_hub_download(repo_id="SoloWayG/Molecule_transformer",
-                         filename="state.json",
-                         local_dir=local_dir,
-                         force_download=True,
-                         token=os.getenv("HF_TOKEN"))
+        sync_state_from_s3()
         case_trainer(data)
         #return json.dumps()
 
     @app.post("/train_gan")
-    def case_gan_run(data:TrainData=Body()):
-        print(os.getenv("HF_TOKEN"))
-        hf_hub_download(repo_id="SoloWayG/Molecule_transformer",
-                         filename="state.json",
-                         local_dir=local_dir,
-                         force_download=True,
-                         token=os.getenv("HF_TOKEN"))
+    def case_gan_run(data:TrainDataS3=Body()):
+        sync_state_from_s3()
         print('train')
-        gan_case_trainer(data)
+        gan_case_trainer_s3(data)
 
     @app.post("/generate_gen_models_by_case")
     def gen_mol_case(data:TrainData=Body()):
-        
-        hf_hub_download(repo_id="SoloWayG/Molecule_transformer",
-                         filename="state.json",
-                         local_dir=local_dir,
-                         force_download=True
-                         ,token=os.getenv("HF_TOKEN"))
+        sync_state_from_s3()
         ret = auto_generator(data)
         return json.dumps(ret)
     
@@ -243,6 +220,7 @@ if __name__=='__main__':
     
     @app.get("/check_state")
     def check_state():
+        sync_state_from_s3()
         state = TrainState(state_path=f'{local_dir}/state.json')
         calc_properies = state.show_calculateble_propreties()
         current_state = state().copy()

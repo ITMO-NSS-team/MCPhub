@@ -194,11 +194,8 @@ def main_generate(server_dir = 'train_dislip',
 #                          timeout=data.timeout)
         
 if __name__ == "__main__":
-    from huggingface_hub import hf_hub_download
-    hf_hub_download(repo_id="SoloWayG/Molecule_transformer",
-                         filename="state.json",
-                         local_dir='autotrain/utils',
-                         force_download=True)
+    from autotrain.utils.state_s3 import download_state_file
+    download_state_file(local_path='autotrain/utils/state.json')
     state = TrainState(state_path='autotrain/utils/state.json')
     CASE = 'MEK1'
     train_data = 'autotrain/data/data_mek.csv'
