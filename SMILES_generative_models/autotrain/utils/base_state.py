@@ -268,26 +268,22 @@ class TrainState:
         state["Calculateble properties"] = config
         return state
     
-    def __validate_properties(self,case:str):
-        """The function checks if the calculated properties are in the list of predicted properties.\
-              It returns the list of predicted properties without calculated ones, so that further training\
-                  does not take into account those properties that can be calculated. \
-            
-            Important! The function works, provided that the names of properties in the columns of the training \
-                dataset match with the names of functions in the “config” file calculateble_prop_funcs.py.
-
-        Args:
-            case (str): Case name.
-        """
-        if self.current_state[case]["ml_models"]["feature_column"] is not None and self.current_state[case]["ml_models"]['Predictable properties'] != {}:
-            temp_predictable_properties = {}
-            for task in self.current_state[case]["ml_models"]['Predictable properties'].keys():
-                temp_predictable_properties[task] = [proper for proper in self.current_state[case]["ml_models"]['Predictable properties'][task] if proper not in self.show_calculateble_propreties()]
-                if len(temp_predictable_properties[task])==0:
-                    del temp_predictable_properties[task]
-            self.current_state[case]["ml_models"]['Predictable properties'] = temp_predictable_properties
-
-        #TODO: add validation matching target columns and calculateble properties
+    def __validate_properties(self, case: str):
+            if (
+                self.current_state[case]["ml_models"]["feature_column"] is not None
+                and self.current_state[case]["ml_models"]["Predictable properties"] != {}
+            ):
+                temp_predictable_properties = {}
+                for task in self.current_state[case]["ml_models"]["Predictable properties"].keys():
+                    if self.current_state[case]["ml_models"]["Predictable properties"][task] is not None:
+                        temp_predictable_properties[task] = [
+                            proper
+                            for proper in self.current_state[case]["ml_models"]["Predictable properties"][task]
+                            if proper not in self.show_calculateble_propreties() and proper is not None
+                        ]
+                        if len(temp_predictable_properties[task]) == 0:
+                            del temp_predictable_properties[task]
+                self.current_state[case]["ml_models"]["Predictable properties"] = temp_predictable_properties
 
 if __name__=='__main__':
     task = 'Brain_cancer_test'

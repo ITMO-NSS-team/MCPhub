@@ -1,10 +1,16 @@
-from typing import List 
+import os
+
+import pandas as pd
 from fastapi import Body
 from pydantic import BaseModel
+
+from utils.automl_main import run_predict_automl_from_list, run_train_automl
 from utils.base_state import TrainState
-from utils.automl_main import run_train_automl,run_predict_automl_from_list
-import pandas as pd
-import os 
+
+try:
+    from s3_utils import S3BucketService, s3_service as default_s3_service
+except ModuleNotFoundError:
+    from .s3_utils import S3BucketService, s3_service as default_s3_service
 
 class MLData(BaseModel):
         """
@@ -46,23 +52,11 @@ class MLData(BaseModel):
         s3_endpoint_url:str = None
 
 
-def _download_dataset_from_s3(data: MLData) -> str:
-    """Download training CSV from S3 and return normalized local path."""
-    try:
-        import boto3
-        from botocore.client import Config
-    except ImportError as exc:
-        raise ImportError("S3 support requires `boto3`. Install it in automl environment.") from exc
-
-    if not data.case:
-        raise ValueError("`case` is required.")
-    if not data.s3_key:
-        raise ValueError("`s3_key` is required for S3 dataset download.")
-
-    endpoint_url = data.endpoint_url or data.s3_endpoint_url or os.getenv("ENDPOINT_URL")
-    access_key = data.access_key or os.getenv("ACCESS_KEY")
-    secret_key = data.secret_key or os.getenv("SECRET_KEY")
-    bucket_name = data.bucket_name or data.s3_bucket or os.getenv("BUCKET_NAME")
+def _build_s3_service(data: MLData) -> S3BucketService:
+    endpoint_url = data.endpoint_url or data.s3_endpoint_url or os.getenv("ENDPOINT_URL") or default_s3_service.endpoint
+    access_key = data.access_key or os.getenv("ACCESS_KEY") or default_s3_service.access_key
+    secret_key = data.secret_key or os.getenv("SECRET_KEY") or default_s3_service.secret_key
+    bucket_name = data.bucket_name or data.s3_bucket or os.getenv("BUCKET_NAME") or default_s3_service.bucket_name
 
     if not endpoint_url:
         raise ValueError("S3 endpoint is empty. Set `endpoint_url` or env `ENDPOINT_URL`.")
@@ -73,6 +67,20 @@ def _download_dataset_from_s3(data: MLData) -> str:
     if not bucket_name:
         raise ValueError("S3 bucket is empty. Set `bucket_name` or env `BUCKET_NAME`.")
 
+    return S3BucketService(
+        endpoint=endpoint_url,
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket_name=bucket_name,
+    )
+
+
+def _download_dataset_from_s3(data: MLData) -> str:
+    """Download training CSV from S3 and return normalized local path."""
+    if not data.case:
+        raise ValueError("`case` is required.")
+    s3_service = _build_s3_service(data)
+
     if not data.data_path:
         data.data_path = f"data/{data.case}/data.csv"
     data.data_path = data.data_path.replace("\\", "/")
@@ -80,14 +88,7 @@ def _download_dataset_from_s3(data: MLData) -> str:
     if local_dir:
         os.makedirs(local_dir, exist_ok=True)
 
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        config=Config(signature_version="s3v4"),
-    )
-    s3_client.download_file(bucket_name, data.s3_key, data.data_path)
+    s3_service.download_image_from_s3(s3_key=f"/train/{data.case}.csv", local_path=data.data_path)
     return data.data_path
 
 
@@ -111,7 +112,7 @@ def train_ml_with_data(data:MLData=Body()):
     state.add_new_case(case_name=data.case,
                         rewrite=True,
                         description=data.description)
-    if data.s3_key:
+    if data.case:
             _download_dataset_from_s3(data)
             df = pd.read_csv(data.data_path).dropna()
             if data.feature_column[0] not in df.columns:
@@ -119,14 +120,14 @@ def train_ml_with_data(data:MLData=Body()):
                     f"Feature column '{data.feature_column[0]}' not found in downloaded file. "
                     f"Available columns: {df.columns.tolist()}"
                 )
-            df = df[df[data.feature_column[0]].astype(str).str.len() < 200]
+            #df = df[df[data.feature_column[0]].astype(str).str.len() < 200]
             df.to_csv(data.data_path, index=False)
     elif data.data is not None:
             df = pd.DataFrame(data.data)
             data.data_path = f"data/{data.case}/data.csv"
             os.makedirs(os.path.dirname(data.data_path), exist_ok=True)
             df = df.dropna()
-            df = df[df[data.feature_column[0]].astype(str).str.len()<200]
+            #df = df[df[data.feature_column[0]].astype(str).str.len()<200]
             df.to_csv(data.data_path, index=False) 
                     
     state.ml_model_upd_data(case=data.case,

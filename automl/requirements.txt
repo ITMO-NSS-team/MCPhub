@@ -8,5 +8,5 @@ uvicorn
 lightgbm
 bio
 fastmcp
-huggingface_hub
 boto3
+python-dotenv

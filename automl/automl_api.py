@@ -11,7 +11,11 @@ import socket
 import yaml
 from api_utils import *
 from utils.base_state import TrainState
-from huggingface_hub import hf_hub_download
+
+try:
+    from utils.state_s3 import download_state_file
+except ModuleNotFoundError:
+    from .utils.state_s3 import download_state_file
 
 with open(os.path.join(import_path, "config.yaml"), "r") as file:
     config = yaml.safe_load(file)
@@ -38,6 +42,11 @@ if __name__=='__main__':
     print(f"Current IP: {ip}")
     print("Starting...")
 
+    def sync_state_from_s3():
+        state_path = os.path.join(import_path, "state.json")
+        download_state_file(local_path=state_path)
+        return state_path
+
     app = FastAPI(debug=True)
     @app.get("/")
     def health_check():
@@ -46,6 +55,7 @@ if __name__=='__main__':
     # API operations
     @app.get("/check_state")
     def check_state():
+        sync_state_from_s3()
         state = TrainState(state_path=os.path.join(import_path, "state.json"))
         calc_properies = state.show_calculateble_propreties()
         current_state = state().copy()
@@ -56,21 +66,13 @@ if __name__=='__main__':
 
     @app.post("/train_ml")
     def train_ml_api(data:MLData=Body()):
-        hf_hub_download(repo_id="SoloWayG/Molecule_transformer",
-                         filename="state.json",
-                         local_dir=import_path,
-                         force_download=True,
-                         token=os.getenv("HF_TOKEN"))
+        sync_state_from_s3()
         train_ml_with_data(data)
 
     @app.post("/predict_ml")
     def predict_ml_api(data:MLData=Body()):
         print(data)
-        hf_hub_download(repo_id="SoloWayG/Molecule_transformer",
-                    filename="state.json",
-                    local_dir=import_path,
-                    force_download=True,
-                    token=os.getenv("HF_TOKEN"))
+        sync_state_from_s3()
         return inference_ml(data)
     
 

@@ -17,7 +17,6 @@ import logging
 from fedot.core.data.data import InputData
 from fedot.core.data.data_split import train_test_data_setup
 import itertools
-from huggingface_hub import HfApi
 from sklearn.metrics import (
     f1_score as f1,
     accuracy_score as accuracy,
@@ -25,6 +24,11 @@ from sklearn.metrics import (
     mean_squared_error as mse,
     r2_score as r2
 )
+
+try:
+    from s3_utils import S3BucketService, s3_service as default_s3_service
+except ModuleNotFoundError:
+    from ..s3_utils import S3BucketService, s3_service as default_s3_service
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 
@@ -66,6 +70,54 @@ def _resolve_existing_path(path_value: str | None) -> str | None:
     if raw.parts and raw.parts[0] == "automl":
         raw = Path(*raw.parts[1:])
     return str(BASE_DIR / raw)
+
+
+def _build_s3_service() -> S3BucketService:
+    endpoint = os.getenv("ENDPOINT_URL") or default_s3_service.endpoint
+    access_key = os.getenv("ACCESS_KEY") or default_s3_service.access_key
+    secret_key = os.getenv("SECRET_KEY") or default_s3_service.secret_key
+    bucket_name = os.getenv("BUCKET_NAME") or default_s3_service.bucket_name
+
+    if not endpoint:
+        raise ValueError("S3 endpoint is empty. Set `ENDPOINT_URL`.")
+    if not access_key:
+        raise ValueError("S3 access key is empty. Set `ACCESS_KEY`.")
+    if not secret_key:
+        raise ValueError("S3 secret key is empty. Set `SECRET_KEY`.")
+    if not bucket_name:
+        raise ValueError("S3 bucket name is empty. Set `BUCKET_NAME`.")
+
+    return S3BucketService(
+        endpoint=endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket_name=bucket_name,
+    )
+
+
+def _upload_folder_to_s3(local_folder: str, case: str) -> None:
+    """Upload all files from local folder into S3 prefix `ml_weights/<case>/...`."""
+    folder_path = Path(local_folder)
+    if not folder_path.is_dir():
+        raise FileNotFoundError(f"Artifacts folder not found: {folder_path}")
+
+    s3_service = _build_s3_service()
+    base_prefix = f"ml_weights/{str(case).strip().strip('/')}/{folder_path.name}".strip("/")
+
+    for file_path in folder_path.rglob("*"):
+        if not file_path.is_file():
+            continue
+        rel_path = file_path.relative_to(folder_path).as_posix()
+        s3_key = f"{base_prefix}/{rel_path}".strip("/")
+        if "/" in s3_key:
+            prefix, source_file_name = s3_key.rsplit("/", 1)
+        else:
+            prefix, source_file_name = "", s3_key
+        s3_service.upload_file_object(
+            prefix=prefix,
+            source_file_name=source_file_name,
+            file_path=str(file_path),
+        )
 
 
 def input_data_preparing(case:str,
@@ -225,13 +277,9 @@ def run_train_automl(case:str,
 
         if save_trained_data_to_sync_server:
             time.sleep(2)
-            api = HfApi(token=os.getenv("HF_TOKEN"))
-            last_folder = path_to_save.split(sep='/')[-1]
-            api.upload_folder(repo_id='SoloWayG/Molecule_transformer',
-                              folder_path=path_to_save+f'_{case}'+f'_{problem}',
-                              path_in_repo=f'ML_models/{last_folder}_{case}_{problem}',
-                              commit_message=f'Add model for {case} case with {problem} problem.',
-                              #delete_patterns=True
+            _upload_folder_to_s3(
+                local_folder=path_to_save + f"_{case}" + f"_{problem}",
+                case=case,
             )
     state.ml_model_upd_status(case=case,metric=metrics,status=2)
     
