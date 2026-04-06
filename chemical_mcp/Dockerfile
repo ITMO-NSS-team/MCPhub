@@ -12,14 +12,14 @@ WORKDIR /app
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-COPY pyproject.toml README.md .
+COPY pyproject.toml README.md ./
 RUN uv sync --no-dev
 
-COPY . . 
+COPY mcp_server/ ./mcp_server/
 
 ENV UV_SYSTEM_PYTHON=1
 
 
 EXPOSE 7331
 
-CMD ["uv", "run", "python", "-m", "server.chemical_server"]
+CMD ["uv", "run", "python", "-m", "mcp_server.chemical_server"]

@@ -2,6 +2,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from docking.docking_py.docking_py.docking import Docking
 import os
+import shutil
 import py3Dmol
 import logging
 import base64
@@ -93,8 +94,9 @@ def run_docking(smiles: str, pdb_id: str, cpu: int = 4) -> Dict:
             - error: str/None - error message if failed
             - visualization: str/None - base64 encoded HTML visualization
     """
+    data_dir = "data"
     try:
-        os.makedirs("data", exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
         logging.info(f"Preparing ligand from SMILES: {smiles}")
         
         mol = Chem.MolFromSmiles(smiles)
@@ -119,22 +121,22 @@ def run_docking(smiles: str, pdb_id: str, cpu: int = 4) -> Dict:
             }
         
         AllChem.UFFOptimizeMolecule(mol)
-        lig_pdb = f"data/{pdb_id}_ligand.pdb"
+        lig_pdb = f"{data_dir}/{pdb_id}_ligand.pdb"
         Chem.MolToPDBFile(mol, lig_pdb)
 
         logging.info(f"Loading protein {pdb_id} from PDB...")
         coor = pdb_manip.Coor()
-        coor.get_PDB(pdb_id, f"data/{pdb_id}.pdb")
+        coor.get_PDB(pdb_id, f"{data_dir}/{pdb_id}.pdb")
 
         rec_coor = coor.select_part_dict(selec_dict={'res_name': pdb_manip.PROTEIN_RES})
-        rec_pdb = f"./data/{pdb_id}_rec.pdb"
+        rec_pdb = f"./{data_dir}/{pdb_id}_rec.pdb"
         rec_coor.write_pdb(rec_pdb)
         
         dock = Docking(name=f"dock_{pdb_id}", rec_pdb=rec_pdb, lig_pdb=lig_pdb)
         dock.prepare_receptor(check_file_out=False)
         dock.prepare_ligand(check_file_out=False)
 
-        out_pdb = f"./data/{pdb_id}_out.pdb"
+        out_pdb = f"./{data_dir}/{pdb_id}_out.pdb"
         dock.run_docking(
             out_pdb=out_pdb,
             dock_bin="smina",
@@ -148,7 +150,7 @@ def run_docking(smiles: str, pdb_id: str, cpu: int = 4) -> Dict:
         aff = dock.affinity
         
         visualization_html = None
-        viz_file = f"data/{pdb_id}_docking_view.html"
+        viz_file = f"{data_dir}/{pdb_id}_docking_view.html"
         if os.path.exists(out_pdb) and os.path.exists(rec_pdb):
             viz_result = visualize_docking(rec_pdb, out_pdb, output_file=viz_file)
             if viz_result and os.path.exists(viz_file):
@@ -192,3 +194,6 @@ def run_docking(smiles: str, pdb_id: str, cpu: int = 4) -> Dict:
             "error": str(e),
             "visualization": None
         }
+    finally:
+        if os.path.isdir(data_dir):
+            shutil.rmtree(data_dir, ignore_errors=True)

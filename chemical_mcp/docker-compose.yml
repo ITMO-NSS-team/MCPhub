@@ -1,21 +1,16 @@
 services:
   chemical-mcp-server:
     build: .
-    ports:
-      - "7331:7331"
     env_file:
       - .env
     restart: unless-stopped
-    networks:
-      - chemical-net
+    network_mode: host
 
   chemical-service:
     profiles: [tools]
     build:
       context: ./chemical_tools_service
     container_name: chemical-service
-    ports:
-      - "8000:80"
     volumes:
       - ./chemical_tools_service:/app
     deploy:
@@ -26,8 +21,7 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
-    networks:
-      - chemical-net
+    network_mode: host
 
   retrosynthesis-api:
     profiles: [tools]
@@ -35,14 +29,7 @@ services:
     build:
       context: ./chemical_tools_service/retrosynthesis
       dockerfile: Dockerfile
-    ports:
-      - "8001:8001"
     env_file:
       - ./chemical_tools_service/retrosynthesis/.env-non-dev
     restart: unless-stopped
-    networks:
-      - chemical-net
-
-networks:
-  chemical-net:
-    driver: bridge
+    network_mode: host

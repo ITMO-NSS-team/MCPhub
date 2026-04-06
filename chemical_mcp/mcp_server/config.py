@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # Chemical service
     chem_services_host: str = Field(default="localhost")
-    chem_services_port: int = Field(default=8005)
+    chem_services_port: int = Field(default=8000)
     chem_services_timeout: int = Field(default=60)
 
     # Retrosynthesis
