@@ -1,0 +1,35 @@
+services:
+  chemical-mcp-server:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    network_mode: host
+
+  chemical-service:
+    profiles: [tools]
+    build:
+      context: ./chemical_tools_service
+    container_name: chemical-service
+    volumes:
+      - ./chemical_tools_service:/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    network_mode: host
+
+  retrosynthesis-api:
+    profiles: [tools]
+    container_name: retrosynthesis-api
+    build:
+      context: ./chemical_tools_service/retrosynthesis
+      dockerfile: Dockerfile
+    env_file:
+      - ./chemical_tools_service/retrosynthesis/.env-non-dev
+    restart: unless-stopped
+    network_mode: host
