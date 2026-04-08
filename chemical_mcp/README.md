@@ -2,102 +2,86 @@
 
 MCP server for chemistry tools: SMILES conversion, molecular properties calculations, docking, molecule/reaction OCR, visualization, retrosynthesis, and forward synthesis prediction.
 
+---
+
+## Quick Start (step by step)
+
+### Option 1: MCP server only
+
+Use this if the chemical API and retrosynthesis services are **already running externally** (e.g., deployed on a remote server or started separately). This option only starts the MCP server itself — it does not launch any backend services.
+
+**Step 1.** Copy the environment variables file:
+```bash
+cp .env.example .env
+```
+
+Point the MCP server to your already-running services by setting the correct hosts and ports in `.env`:
+```env
+CHEM_SERVICES_HOST=<host of your chemical API>
+CHEM_SERVICES_PORT=8000
+RETROSYNTHESIS_SERVICES_HOST=<host of your retrosynthesis API>
+RETROSYNTHESIS_SERVICES_PORT=8001
+S3_ENDPOINT_URL= https://storage.yandexcloud.net
+S3_BUCKET_NAME=coscientist
+S3_ACCESS_KEY=YCXXX
+S3_SECRET_KEY=YCXXX
+```
+
+**Step 2.** Start the MCP server container:
+```bash
+docker compose up --build
+```
+
+The MCP server will be available at `http://localhost:7331/mcp`.
+
+---
+
+### Option 2: MCP server + chemical API + retrosynthesis (recommended)
+
+Required for docking, retrosynthesis, and forward synthesis. A separately deployed **ASKCOS** instance is needed.
+
+**Step 1.** Copy and edit `.env` (If you don't make this in previous Option 1):
+
+```bash
+cp .env.example .env
+```
+
+Make sure the correct hosts and ports are set in `.env`:
+```env
+CHEM_SERVICES_HOST=localhost
+CHEM_SERVICES_PORT=8000
+RETROSYNTHESIS_SERVICES_HOST=localhost
+RETROSYNTHESIS_SERVICES_PORT=8001
+```
+
+**Step 2.** Configure ASKCOS access — create the credentials file (any values will work, so simply run):
+
+```bash
+cp chemical_tools_service/retrosynthesis/.env_example \
+   chemical_tools_service/retrosynthesis/.env
+```
+
+**Step 3.** If ASKCOS is not yet deployed — do a full deploy (first time only):
+```bash
+make all-deploy
+```
+> This will start MCP + chemical API + retrosynthesis + ASKCOS with database initialization.
+
+For subsequent runs (ASKCOS already installed):
+```bash
+make all
+```
+
+Or, if ASKCOS is already running and you only need MCP + tools containers:
+```bash
+make compose
+```
+
 ## Requirements
 
 - Python 3.11+
 - Optional: [uv](https://docs.astral.sh/uv/) for install/run
 - Optional: Docker & docker-compose for containerized run
-
-## Run with Docker
-
-Compose uses [profiles](https://docs.docker.com/compose/how-tos/profiles/) and **`network_mode: host`** for all services in `docker-compose.yml`: they share the **host** network namespace (no published `ports:` mapping). Each process listens on the host on its configured port (e.g. MCP **7331**, chemical API **8000**, retrosynthesis wrapper **8001**—match your app settings).
-
-| Command | What starts |
-| ------- | ----------- |
-| `docker compose up --build` | **chemical-mcp-server** only (profile default). |
-| `docker compose --profile tools up --build` | MCP + **chemical-service** + **retrosynthesis-api** (ASKCOS HTTP wrapper). |
-
-```bash
-cp .env.example .env
-docker compose up --build
-docker compose --profile tools up --build
-```
-
-**Linux note:** `network_mode: host` ignores Compose `ports:`; avoid port clashes with other daemons on the same machine.
-
-### `.env` with `--profile tools` and host networking
-
-All containers see **localhost** as the host. Point the MCP server at **host ports**, not Docker DNS names:
-
-| Variable | Typical value |
-| -------- | ------------- |
-| `CHEM_SERVICES_HOST` | `localhost` |
-| `CHEM_SERVICES_PORT` | `8000` |
-| `RETROSYNTHESIS_SERVICES_HOST` | `localhost` |
-| `RETROSYNTHESIS_SERVICES_PORT` | `8001` |
-
-### Retrosynthesis → ASKCOS (also on host)
-
-Create `chemical_tools_service/retrosynthesis/.env-non-dev` (see `chemical_tools_service/retrosynthesis/README.md`: copy from `.env_example`, set `USER_ASKCOS`, `PASSWORD_ASKCOS`).
-
-If **ASKCOS** is deployed with **`network_mode: host`** as well (default `askcos2_core` layout for `app` / `web`), the API is on the host (commonly **9100**). Use:
-
-```env
-ASKCOS_BASE_URL=http://127.0.0.1:9100
-```
-
-(or `http://localhost:9100`).
-
-## Makefile (`chemical_mcp/Makefile`)
-
-From `chemical_mcp/`, **`make compose`** runs **`docker compose --profile tools up --build -d`**. ASKCOS is driven from **`chemical_tools_service/retrosynthesis/ASKCOSv2/askcos2_core`** via its own `Makefile` (`deploy` / `update`).
-
-**Requirements:** Docker, `make`, and host **Python 3** with **`pip`** for ASKCOS deploy scripts. Cloning ASKCOS module repos needs **SSH** (`git@gitlab.com`) or **HTTPS** URLs in the chosen `module_config_*.py`.
-
-| Target | What it does |
-| ------ | ------------ |
-| `make` / `make help` | List targets |
-| `make all-deploy` | Compose (**tools**) + ASKCOS **`deploy`** (includes **seed-db** when deploy runs it) |
-| `make all` | Compose (**tools**) + ASKCOS **`update`** (no Mongo **seed-db**) | 
-| `make compose` | Compose **tools** only (`up --build -d`) |
-| `make askcos` | ASKCOS **`deploy`** only |
-| `make askcos-update` | ASKCOS **`update`** only |
-| `make askcos-deps` | Ensure **PyYAML** on the host Python |
-
-**Typical flow:** once **`make all-deploy`** (or **`make askcos`**) has completed a full ASKCOS install, use **`make all`** for routine restarts. If ASKCOS is already up and you only need MCP + tools containers, run **`make compose`**.
-
-### Running only the tool services
-
-You can use `chemical_tools_service/docker-compose.yaml` for **chemical-service** and **retrosynthesis-api** without the MCP container; set the root `.env` hosts/ports to wherever those APIs listen.
-
-## Run with Docker (one-off)
-
-```bash
-docker build -t chemical-mcp-server .
-docker run -p 7331:7331 --env-file .env chemical-mcp-server
-```
-
-## Environment (.env)
-
-
-| Variable                         | Description                                      | Default     |
-| -------------------------------- | ------------------------------------------------ | ----------- |
-| `CHEM_SERVICES_HOST`             | Host of the chemistry API (OpenChemIE/docking)   | `localhost` |
-| `CHEM_SERVICES_PORT`             | Port of the chemistry API (host network: app bind port) | `8000` |
-| `CHEM_SERVICES_TIMEOUT`          | Request timeout for chemistry API (seconds)      | `60`        |
-| `RETROSYNTHESIS_SERVICES_HOST`   | Host of the retrosynthesis/ASKCOS API            | `localhost` |
-| `RETROSYNTHESIS_SERVICES_PORT`   | Port of the retrosynthesis/ASKCOS API            | `8001`      |
-| `RETROSYNTHESIS_REQUEST_TIMEOUT` | Request timeout for retrosynthesis API (seconds) | `60`        |
-| `S3_ENDPOINT_URL`                | S3-compatible storage endpoint URL               | —           |
-| `S3_BUCKET_NAME`                 | S3 bucket for storing images and visualizations  | —           |
-| `S3_ACCESS_KEY`                  | S3 access key                                    | —           |
-| `S3_SECRET_KEY`                  | S3 secret key                                    | —           |
-| `CHEM_MCP_HOST`                  | MCP server bind address                          | `0.0.0.0`   |
-| `CHEM_MCP_PORT`                  | MCP server port                                  | `7331`      |
-| `CHEM_MCP_PATH`                  | MCP server HTTP path                             | `/mcp`      |
-
-
-Copy `.env.example` to `.env` and adjust as needed.
 
 ## Tools exposed via MCP
 
