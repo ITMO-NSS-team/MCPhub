@@ -1,0 +1,41 @@
+language: generic
+
+# Doesn't matter, tox will test py35, py36, py37 and py38
+python:
+  - "3.8"
+
+matrix:
+    include:
+        - os: linux
+#        - os: osx  # Removed because of credit issues
+
+install:
+  - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; 
+      then 
+        sudo apt-get update; 
+        MINICONDA_OS=Linux; 
+      else 
+        MINICONDA_OS=MacOSX; 
+    fi
+  - wget https://repo.anaconda.com/miniconda/Miniconda3-latest-$MINICONDA_OS-x86_64.sh -O miniconda.sh;
+  - bash miniconda.sh -b -p $HOME/miniconda
+  - source "$HOME/miniconda/etc/profile.d/conda.sh"
+  - hash -r
+  - conda config --set always_yes yes --set changeps1 no
+  - conda update -q conda
+  # Useful for debugging any issues with conda
+  - conda info -a
+  - conda env create -f .conda.yml
+  - conda activate docking
+  # Need to update pip, setuptools and wheel only for python3.5
+  - pip install -U pip setuptools wheel 
+  # Install tox-conda to use tox in conda
+  - pip install tox-conda
+  - pip install codecov
+  - pip install -r requirements.txt
+
+script:
+  - tox
+
+after_success:
+  - codecov
