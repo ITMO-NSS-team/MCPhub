@@ -46,3 +46,5 @@ Thumbs.db
 # Env files
 .env
 .env.*
+# Keep example template tracked so newcomers know which vars to set.
+!.env.example

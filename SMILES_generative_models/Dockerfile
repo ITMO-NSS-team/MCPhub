@@ -3,16 +3,12 @@ FROM nvidia/cuda:11.4.3-runtime-ubuntu20.04
 # Установка временной зоны
 ENV TZ=Europe/Moscow
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
-ARG CSNTS_HF_TOK
-ARG CSNTS_GITHUB_TOKEN
-ARG CSNTS_GEN_MOLS_MODEL_APP_PORT
-ARG CSNTS_ML_MOLS_MODEL_APP_URL
-ARG CSNTS_MOLS_GEN_MCP_PORT
-ARG CSNTS_S3_ENDPOINT_URL
-ARG CSNTS_S3_ACCESS_KEY
-ARG CSNTS_S3_SECRET_KEY
-ARG CSNTS_S3_BUCKET_NAME="molecule-generative-mcp"
 
+# Build-time arg used ONLY for the build-time `huggingface-cli download` below
+# (only needed when pulling a private model). Defaults to empty so it does not
+# end up baked into image layers. Pass via `docker build --build-arg HF_TOK=...`
+# if the model becomes private. Runtime HF_TOKEN is loaded from `.env`.
+ARG HF_TOK=""
 
 # Установка базовых зависимостей
 RUN apt-get update && apt-get install --no-install-recommends -y \
@@ -63,23 +59,28 @@ RUN ~/miniconda3/envs/Mol_gen_env/bin/pip install -r requirements.txt
 RUN conda create -n MCP_env python=3.13 && \
     ~/miniconda3/envs/MCP_env/bin/pip install -r requirements.mcp.txt
 
-RUN ~/miniconda3/envs/Mol_gen_env/bin/huggingface-cli download SoloWayG/Molecule_transformer --local-dir autotrain/
+RUN HF_TOKEN="$HF_TOK" ~/miniconda3/envs/Mol_gen_env/bin/huggingface-cli download \
+    SoloWayG/Molecule_transformer --local-dir autotrain/
 
-# Настройка переменных окружения
-ENV ML_MOLS_MODEL_APP_URL=$CSNTS_ML_MOLS_MODEL_APP_URL
-ENV HF_TOKEN=$CSNTS_HF_TOK
+# Non-secret runtime path setup. All secrets and runtime config (S3 creds,
+# HF_TOKEN, ports, ML_MOLS_MODEL_APP_URL, ...) come from a `.env` file at
+# container start time. See `.env.example` for the full list and
+# `docker-compose.yml` (env_file: .env) for wiring. Python-dotenv
+# (`load_dotenv()` in main_mcp.py / main_api.py) reads it from the WORKDIR
+# (/projects/generative_models/.env). Alternatively use
+# `docker run --env-file .env`.
 ENV LD_LIBRARY_PATH="/opt/conda/envs/Mol_gen_env/lib:$LD_LIBRARY_PATH"
 ENV PYTHONPATH="/projects/generative_models:$PYTHONPATH"
 ENV PYTHONPATH="/projects/CoScientist/:$PYTHONPATH"
 ENV PYTHONPATH="/projects/:$PYTHONPATH"
-ENV GEN_MOLS_MODEL_APP_PORT=$CSNTS_GEN_MOLS_MODEL_APP_PORT
-ENV MOLS_GEN_MCP_PORT=$CSNTS_MOLS_GEN_MCP_PORT
-ENV ENDPOINT_URL=$CSNTS_S3_ENDPOINT_URL
-ENV ACCESS_KEY=$CSNTS_S3_ACCESS_KEY
-ENV SECRET_KEY=$CSNTS_S3_SECRET_KEY
-ENV BUCKET_NAME=$CSNTS_S3_BUCKET_NAME
 
 # Запуск
-RUN chmod +x /projects/generative_models/api.sh
+# Strip CRLF defensively: if someone clones the repo on Windows with
+# core.autocrlf=true, api.sh ends up with \r\n line endings and bash on
+# Linux reads each trailing \r as part of the last token (cd target path,
+# conda env name, etc.) — every command silently fails. `sed` makes the
+# shipped image immune regardless of the developer's local git config.
+RUN sed -i 's/\r$//' /projects/generative_models/api.sh \
+    && chmod +x /projects/generative_models/api.sh
 ENTRYPOINT ["/bin/bash", "/projects/generative_models/api.sh"]
 

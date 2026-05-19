@@ -1,60 +1,145 @@
-# llm_agents_chemistry
+# automl MCP server
 
-# Installation
+MCP server for AutoML training and inference of molecular-property models
+(regression / classification over SMILES features). Trained pipelines and
+predictions are exchanged with the agent **via S3 links**, not inline arrays.
 
-```
-path/to/python3.10.exe -m venv env
+## Build & run with Docker
 
-pip install -r requirements.txt
+Secrets and runtime config live in a `.env` file at container start time —
+the Dockerfile does **not** bake S3 credentials or ports into the image
+anymore.
 
-source env/Scripts/activate
-```
-
-# Docker
-
-Build image (`automl` Dockerfile now accepts only `CSNTS_...` build args):
+### 1. Prepare `.env`
 
 ```bash
 cd automl
-
-docker build -t automl_mcp \
-  --build-arg CSNTS_MOLS_ML_MCP_PORT=8777 \
-  --build-arg CSNTS_S3_ENDPOINT_URL=http://10.32.1.114:9000 \
-  --build-arg CSNTS_S3_ACCESS_KEY='user' \
-  --build-arg CSNTS_S3_SECRET_KEY = SECRET_KEY \
-  --build-arg CSNTS_S3_BUCKET_NAME=molecule-generative-mcp \
-  -f automl/Dockerfile .
+cp .env.example .env
+# edit .env: set ENDPOINT_URL / ACCESS_KEY / SECRET_KEY / BUCKET_NAME / STATE_S3_KEY
 ```
 
-Run container:
+Minimum variables (see `.env.example` for the full list):
+
+| Variable | Purpose |
+| --- | --- |
+| `ENDPOINT_URL` | S3-compatible endpoint (e.g. `http://10.32.1.114:9000`) |
+| `ACCESS_KEY` / `SECRET_KEY` | S3 credentials |
+| `BUCKET_NAME` | Bucket for `train/`, `ml_weights/`, `predictions/`, `state/` |
+| `STATE_S3_KEY` | S3 key for the shared `state.json` (default `state/state.json`) |
+| `MOLS_ML_MCP_PORT` | MCP HTTP port inside the container (default `8777`) |
+| `MCP_HOST` / `MCP_TRANSPORT` | `0.0.0.0` / `http` |
+
+### 2. Build the image (no `--build-arg` needed)
 
 ```bash
-docker run --name automl_mcp_server --rm -it \
+docker build -t automl_mcp .
+```
+
+The image is reusable across environments — same image, different `.env`.
+
+### 3. Run
+
+Pick one of:
+
+**docker compose (recommended)** — picks up `.env` automatically via the
+`env_file:` directive in `docker-compose.yml`:
+
+```bash
+docker compose up -d --build
+```
+
+**docker run** — pass `.env` explicitly:
+
+```bash
+docker run --name automl_mcp_server \
+  --env-file .env \
   -p 8777:8777 \
-   automl_mcp
+  automl_mcp
 ```
 
-# Environment (S3 + MCP)
+The MCP server listens on `http://<host>:${MOLS_ML_MCP_PORT}/mcp/`.
 
-Set these variables for downloading train datasets from S3:
+### 4. Verify
 
+From any machine that can reach the host:
+
+```python
+from fastmcp.client import Client
+import asyncio
+
+async def main():
+    async with Client("http://<host>:8777/mcp/") as c:
+        for t in await c.list_tools():
+            print(t.name)
+
+asyncio.run(main())
 ```
-ENDPOINT_URL=<s3_endpoint_url>
-ACCESS_KEY=<s3_access_key>
-SECRET_KEY=<s3_secret_key>
-BUCKET_NAME=<s3_bucket_name>
-STATE_S3_KEY=state/state.json
-MOLS_ML_MCP_PORT=8777
+
+Expected tools: `list_s3_train_cases`, `get_s3_train_case_columns`,
+`health_check`, `check_state`, `train_ml`, `train_ml_job_status`, `predict_ml`.
+
+## MCP contract — data exchange via S3
+
+### `train_ml`
+
+The training CSV is supplied as an HTTP(S) URL (e.g. an S3 presigned URL),
+which the backend fetches via plain `requests.get(...)`. No S3 credentials
+are required to read the URL — it can point to any reachable endpoint or
+account.
+
+```python
+train_ml(
+    case="Alzheimer_v2",
+    train_data_url="http://10.32.1.114:9000/molecule-generative-mcp/train/Alzheimer.csv?X-Amz-...",
+    feature_column=["canonical_smiles"],
+    target_column=["docking_score"],
+    regression_props=["docking_score"],
+    save_trained_data_to_sync_server=True,  # upload weights to S3 (default)
+)
 ```
 
-If `save_trained_data_to_sync_server=true`, trained model artifacts are uploaded to:
-`ml_weights/<case>/...` in the same S3 bucket.
+The tool returns immediately with a `job_id`; training runs in a background
+process. Poll status with `train_ml_job_status(job_id=...)` and read case-level
+metrics from `check_state()`.
 
-Run MCP server:
+Trained Fedot pipelines land in
+`s3://<bucket>/ml_weights/<case>/trained_data_<case>_<problem>/...`.
 
+### `predict_ml`
+
+Input is either an inline `smiles_list` OR `input_s3_key` (CSV in S3 with
+a SMILES column). Predictions are uploaded to
+`s3://<bucket>/predictions/<case>/<uuid>.csv` and the response carries a
+presigned URL. Set `return_inline_predictions=True` to also include the raw
+dict in the response.
+
+Resilience: before inference the tool checks that pipeline weights are
+available locally; if missing it tries to download them from
+`s3://<bucket>/ml_weights/<case>/...`. If nothing is found a structured error
+response is returned (`status: "case_not_found" / "weights_not_found" / ...`)
+instead of raising — the agent can branch on `status`.
+
+## Updating an already-deployed container
+
+After pulling new code, rebuild and restart:
+
+```bash
+docker compose up -d --build
+# or, if running via `docker run`:
+docker build -t automl_mcp .
+docker rm -f automl_mcp_server 2>/dev/null
+docker run --name automl_mcp_server --rm --env-file .env -p 8777:8777 automl_mcp
 ```
+
+`.env` changes alone do **not** propagate into a running container — restart
+the container after editing `.env`.
+
+## Local development (no Docker)
+
+```bash
+python -m venv .venv
+source .venv/Scripts/activate     # or .venv/bin/activate on Linux/macOS
+pip install -r requirements.txt
+cp .env.example .env               # then edit
 python automl_mcp.py
 ```
-
-`train_ml` in MCP runs in background process and returns `job_id` immediately.
-Use `train_ml_job_status(job_id=...)` to poll process status, and `check_state` to see case-level training status/metrics.

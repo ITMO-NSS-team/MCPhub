@@ -1,8 +1,10 @@
-from typing import List 
+from typing import Any, Dict, List, Optional
+from pathlib import Path
 from fastapi import Body
 import os
 import sys
 import types
+import requests
 from pydantic import BaseModel
 from inference import predict_smiles
 from autotrain.utils.base_state import TrainState
@@ -85,6 +87,226 @@ def _normalize_prop_values(values, expected_size: int) -> list:
     return values + [None] * (expected_size - len(values))
 
 
+_GENERIC_GAN_CASE_TOKENS = {"", "rnmd", "rndm", "default", "gan_default", "none"}
+
+
+def _build_s3_service_for_gan(
+    endpoint_url: Optional[str] = None,
+    access_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    bucket_name: Optional[str] = None,
+) -> Optional[S3BucketService]:
+    """Build an S3 client from explicit values or env vars. Returns None if
+    any required credential is missing — callers can then degrade gracefully
+    instead of crashing the FastAPI request."""
+    endpoint = endpoint_url or os.getenv("ENDPOINT_URL")
+    access = access_key or os.getenv("ACCESS_KEY")
+    secret = secret_key or os.getenv("SECRET_KEY")
+    bucket = bucket_name or os.getenv("BUCKET_NAME")
+    if not all([endpoint, access, secret, bucket]):
+        return None
+    return S3BucketService(
+        endpoint=endpoint,
+        access_key=access,
+        secret_key=secret,
+        bucket_name=bucket,
+    )
+
+
+def upload_gan_weights_folder_to_s3(
+    case: str,
+    local_folder: str,
+    s3_service: Optional[S3BucketService] = None,
+) -> Dict[str, Any]:
+    """Recursively upload `local_folder` into `gan_weights/{case}/{folder_name}/...`
+    in the configured S3 bucket. Returns a small status dict (uploaded files,
+    bucket, prefix) — never raises on missing credentials, just reports `no_s3`.
+    """
+    folder_path = Path(local_folder)
+    if not folder_path.is_dir():
+        return {
+            "status": "no_local_folder",
+            "message": f"Local weights folder not found: {folder_path}",
+            "local_folder": str(folder_path),
+        }
+    service = s3_service if s3_service is not None else _build_s3_service_for_gan()
+    if service is None:
+        return {
+            "status": "no_s3",
+            "message": "S3 credentials not set; skipping weights upload.",
+            "local_folder": str(folder_path),
+        }
+    case_slug = (case or "").strip().strip("/")
+    if not case_slug:
+        return {
+            "status": "no_case",
+            "message": "Case name is empty; skipping weights upload.",
+        }
+    base_prefix = f"gan_weights/{case_slug}/{folder_path.name}".strip("/")
+    uploaded = 0
+    for file_path in folder_path.rglob("*"):
+        if not file_path.is_file():
+            continue
+        rel_path = file_path.relative_to(folder_path).as_posix()
+        s3_key = f"{base_prefix}/{rel_path}".strip("/")
+        if "/" in s3_key:
+            prefix, source_file_name = s3_key.rsplit("/", 1)
+        else:
+            prefix, source_file_name = "", s3_key
+        service.upload_file_object(
+            prefix=prefix,
+            source_file_name=source_file_name,
+            file_path=str(file_path),
+        )
+        uploaded += 1
+    return {
+        "status": "uploaded",
+        "bucket_name": service.bucket_name,
+        "s3_prefix": base_prefix + "/",
+        "files_uploaded": uploaded,
+        "local_folder": str(folder_path),
+    }
+
+
+def download_gan_weights_folder_from_s3(
+    s3_prefix: str,
+    local_target_dir: str,
+    s3_service: Optional[S3BucketService] = None,
+) -> int:
+    """Download every object under `s3_prefix` into `local_target_dir`.
+
+    Returns:
+        Number of files downloaded. Zero means the prefix is empty / does not
+        exist or S3 credentials are missing.
+    """
+    service = s3_service if s3_service is not None else _build_s3_service_for_gan()
+    if service is None:
+        return 0
+    normalized_prefix = s3_prefix.replace("\\", "/").lstrip("/")
+    if not normalized_prefix.endswith("/"):
+        normalized_prefix = normalized_prefix + "/"
+    keys = service.list_objects(prefix=normalized_prefix)
+    if not keys:
+        return 0
+    target = Path(local_target_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    downloaded = 0
+    for key in keys:
+        if key.startswith(normalized_prefix):
+            relative = key[len(normalized_prefix):]
+        else:
+            relative = key
+        relative = relative.lstrip("/")
+        if not relative:
+            continue
+        local_file = target / relative
+        local_file.parent.mkdir(parents=True, exist_ok=True)
+        service.download_image_from_s3(s3_key=key, local_path=str(local_file))
+        downloaded += 1
+    return downloaded
+
+
+def ensure_gan_weights_available(case: str) -> Dict[str, Any]:
+    """Verify that GAN weights for `case` are available locally; download from
+    S3 if missing.
+
+    Returns:
+        Dict with keys:
+        - `status`: one of
+            * `ok`              — `gan_weights.pkl` is present locally
+              (cached or just downloaded from S3).
+            * `case_not_found`  — case is not registered in state.json.
+            * `case_not_trained`— case is registered but has no `weights_path`
+              recorded (training never finished or never ran).
+            * `weights_not_found` — `weights_path` is set, but the file is
+              missing locally and no S3 backup exists at the expected prefix.
+        - `case`, `message`, `local_path`, `s3_prefix`, `source`,
+          `files_downloaded` — populated where relevant.
+    """
+    case_name = (case or "").strip()
+    if not case_name:
+        return {
+            "status": "case_not_found",
+            "case": case,
+            "message": "Empty `case` name.",
+        }
+
+    state = TrainState(state_path='autotrain/utils/state.json')
+    case_state = state(case_name)
+    if case_state is None:
+        return {
+            "status": "case_not_found",
+            "case": case_name,
+            "message": (
+                f"Case '{case_name}' is not registered in state.json. "
+                "Train a GAN first via `start_generative_model_training`."
+            ),
+        }
+
+    gen_state = state(case_name, "gen")
+    weights_path = gen_state.get("weights_path") if gen_state else None
+    if not weights_path:
+        return {
+            "status": "case_not_trained",
+            "case": case_name,
+            "message": (
+                f"Case '{case_name}' has no GAN weights recorded. "
+                "Train via `start_generative_model_training`."
+            ),
+        }
+
+    weights_dir = Path(weights_path)
+    weights_file = weights_dir / "gan_weights.pkl"
+    if weights_file.is_file():
+        return {
+            "status": "ok",
+            "case": case_name,
+            "source": "local_cache",
+            "local_path": str(weights_file),
+            "weights_dir": str(weights_dir),
+        }
+
+    folder_name = weights_dir.name
+    s3_prefix = f"gan_weights/{case_name}/{folder_name}/"
+    try:
+        count = download_gan_weights_folder_from_s3(s3_prefix, str(weights_dir))
+    except Exception as exc:
+        return {
+            "status": "weights_not_found",
+            "case": case_name,
+            "message": (
+                f"Failed to download GAN weights from S3 prefix '{s3_prefix}': "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "s3_prefix": s3_prefix,
+            "weights_dir": str(weights_dir),
+        }
+
+    if count > 0 and weights_file.is_file():
+        return {
+            "status": "ok",
+            "case": case_name,
+            "source": "s3",
+            "local_path": str(weights_file),
+            "weights_dir": str(weights_dir),
+            "s3_prefix": s3_prefix,
+            "files_downloaded": count,
+        }
+
+    return {
+        "status": "weights_not_found",
+        "case": case_name,
+        "message": (
+            f"GAN weights for case '{case_name}' are not available locally and "
+            f"no S3 backup at `{s3_prefix}` (in the configured bucket). "
+            "Retrain via `start_generative_model_training` "
+            "(default `save_trained_data_to_sync_server=True`)."
+        ),
+        "s3_prefix": s3_prefix,
+        "weights_dir": str(weights_dir),
+    }
+
+
 class GenData(BaseModel):
         numb_mol: int =1
         model:str = None
@@ -120,6 +342,10 @@ class TrainDataS3(BaseModel):
         secret_key:str = os.getenv("SECRET_KEY")
         bucket_name:str = os.getenv("BUCKET_NAME")
         s3_key:str = None
+        # Full HTTP/HTTPS URL of the training CSV (e.g. an S3 presigned URL).
+        # When set, takes precedence over `s3_key`: the CSV is fetched via
+        # `requests.get(...)` and no S3 credentials are required to read it.
+        data_url:str = None
         data_path:str = None
         feature_column:list = ['Smiles']
         # Backward compatibility with common typo/casing in clients.
@@ -127,6 +353,11 @@ class TrainDataS3(BaseModel):
         future_column:list = None
         fine_tune:bool = True
         epochs:int = 10
+        # When True, after `auto_train` finishes the trained GAN folder
+        # (autotrain/GAN_weights/train_GAN_{case}/) is recursively uploaded to
+        # `s3://{bucket}/gan_weights/{case}/train_GAN_{case}/...` so a fresh
+        # inference container can fetch it on demand.
+        save_trained_data_to_sync_server:bool = True
         # Backward compatibility with previous payload names.
         s3_bucket:str = None
         s3_endpoint_url:str = None
@@ -400,7 +631,10 @@ def gan_case_trainer_s3(data:TrainDataS3=Body()):
     # ##################
     #Docking score
     is_evalute_docking = False
-    """Copy of GAN trainer that downloads train dataset from S3 before fit."""
+    """GAN trainer that fetches the train dataset either from an S3 object
+    (`data.s3_key`) or from an arbitrary HTTP(S) URL (`data.data_url`, e.g.
+    an S3 presigned URL), then fine-tunes the GAN and optionally uploads the
+    trained weights back to S3."""
     state = TrainState(state_path='autotrain/utils/state.json')
     try:
         if data.case is None:
@@ -408,8 +642,13 @@ def gan_case_trainer_s3(data:TrainDataS3=Body()):
         data.case = data.case.strip()
         if not data.case:
             raise ValueError("`case` must not be empty.")
-        if not data.s3_key:
-            raise ValueError("`s3_key` is required.")
+        data_url = (data.data_url or "").strip() or None
+        s3_key = (data.s3_key or "").strip() or None
+        if not data_url and not s3_key:
+            raise ValueError(
+                "Either `data_url` (HTTP(S) URL of the train CSV, e.g. a presigned URL) "
+                "or `s3_key` is required."
+            )
         feature_column = _resolve_feature_columns(data)
 
         # Ensure case exists in state before any updates/status writes.
@@ -423,27 +662,53 @@ def gan_case_trainer_s3(data:TrainDataS3=Body()):
         if local_dir:
             os.makedirs(local_dir, exist_ok=True)
 
+        # Resolve S3 credentials. They're needed for the S3-key download path
+        # AND for uploading trained weights afterwards. When `data_url` is set
+        # and `save_trained_data_to_sync_server` is False, S3 creds are not
+        # mandatory — we degrade gracefully in that case.
         endpoint_url = data.endpoint_url or data.s3_endpoint_url or os.getenv("ENDPOINT_URL")
         access_key = data.access_key or os.getenv("ACCESS_KEY")
         secret_key = data.secret_key or os.getenv("SECRET_KEY")
         bucket_name = data.bucket_name or data.s3_bucket or os.getenv("BUCKET_NAME")
 
-        if not endpoint_url:
-            raise ValueError("S3 endpoint is empty. Set `endpoint_url` or env `ENDPOINT_URL`.")
-        if not access_key:
-            raise ValueError("S3 access key is empty. Set `access_key` or env `ACCESS_KEY`.")
-        if not secret_key:
-            raise ValueError("S3 secret key is empty. Set `secret_key` or env `SECRET_KEY`.")
-        if not bucket_name:
-            raise ValueError("S3 bucket is empty. Set `bucket_name` or env `BUCKET_NAME`.")
+        s3_service: Optional[S3BucketService] = None
+        if all([endpoint_url, access_key, secret_key, bucket_name]):
+            s3_service = S3BucketService(
+                endpoint=endpoint_url,
+                access_key=access_key,
+                secret_key=secret_key,
+                bucket_name=bucket_name,
+            )
 
-        s3_service = S3BucketService(
-            endpoint=endpoint_url,
-            access_key=access_key,
-            secret_key=secret_key,
-            bucket_name=bucket_name
-        )
-        s3_service.download_image_from_s3(s3_key=data.s3_key, local_path=data.data_path)
+        # ---- Dataset download ----
+        if data_url:
+            # HTTP/HTTPS path — fetch the CSV directly. Works for S3 presigned
+            # URLs, arbitrary public URLs, etc. No S3 client involved.
+            print(f"Downloading training CSV via HTTP -> {data.data_path}")
+            timeout_s = int(os.getenv("TRAIN_DATA_HTTP_TIMEOUT_S", "1800"))
+            with requests.get(data_url, stream=True, timeout=timeout_s) as resp:
+                resp.raise_for_status()
+                with open(data.data_path, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            fh.write(chunk)
+            print(f"Downloaded {os.path.getsize(data.data_path)} bytes from URL")
+        else:
+            if s3_service is None:
+                missing = [
+                    name for name, value in (
+                        ("ENDPOINT_URL", endpoint_url),
+                        ("ACCESS_KEY", access_key),
+                        ("SECRET_KEY", secret_key),
+                        ("BUCKET_NAME", bucket_name),
+                    ) if not value
+                ]
+                raise ValueError(
+                    "Cannot download training CSV by `s3_key`: missing S3 credentials. "
+                    f"Provide them via env or payload (missing: {missing}). "
+                    "Alternatively pass `data_url` with a presigned HTTP URL."
+                )
+            s3_service.download_image_from_s3(s3_key=s3_key, local_path=data.data_path)
 
         # Keep behavior close to gan_case_trainer: sanitize and save local csv before training.
         df = pd.read_csv(data.data_path).dropna()
@@ -479,6 +744,25 @@ def gan_case_trainer_s3(data:TrainDataS3=Body()):
             steps=data.epochs
         )
 
+        if getattr(data, "save_trained_data_to_sync_server", True):
+            local_weights_folder = f"autotrain/GAN_weights/train_GAN_{data.case}"
+            try:
+                if s3_service is None:
+                    print(
+                        "GAN weights upload to S3 skipped: S3 credentials are not "
+                        "configured. Training completed; weights are kept locally."
+                    )
+                else:
+                    upload_status = upload_gan_weights_folder_to_s3(
+                        case=data.case,
+                        local_folder=local_weights_folder,
+                        s3_service=s3_service,
+                    )
+                    print(f"GAN weights upload to S3: {upload_status}")
+            except Exception as upload_exc:
+                # Upload failure must not invalidate a successful training run.
+                print(f"GAN weights upload to S3 failed: {upload_exc}")
+
     except Exception as e:
         print(e)
         if getattr(data, "case", None) and state(data.case) is not None:
@@ -487,34 +771,59 @@ def gan_case_trainer_s3(data:TrainDataS3=Body()):
 def gan_auto_generator(data:GenData=Body()):
     state = TrainState(state_path='autotrain/utils/state.json')
 
-    gen_state = state(data.case_, 'gen')
-    weights_candidates = []
-    if gen_state is not None and gen_state.get('weights_path'):
-        weights_candidates.append(os.path.join(gen_state['weights_path'], 'gan_weights.pkl'))
-    weights_candidates.extend([
-        os.path.join('autotrain', 'many_prop_CVAE', 'weights_8p_alzhmr', 'gan_weights.pkl'),
-        os.path.join('GAN', 'gan_lstm_refactoring', 'weights', 'v4_gan_mol_124_0.0003_8k.pkl')
-    ])
-    weights_candidates = list(dict.fromkeys(weights_candidates))
+    raw_case = (data.case_ or "").strip()
+    is_case_request = raw_case.lower() not in _GENERIC_GAN_CASE_TOKENS
+
+    weights_candidates: List[str] = []
+    weights_status: Dict[str, Any] = {"status": "ok", "case": raw_case or None}
+
+    if is_case_request:
+        # Strict case mode: weights MUST be the case-specific ones; if missing
+        # locally, try to download them from S3. Never silently fall back to
+        # generic GAN — the caller asked for a specific trained case.
+        weights_status = ensure_gan_weights_available(raw_case)
+        if weights_status.get("status") != "ok":
+            return weights_status
+        weights_candidates.append(weights_status["local_path"])
+    else:
+        # Generic mode (no case requested): use the bundled fallback weights
+        # that ship with the image / are pulled from HF at build time.
+        gen_state = state(raw_case, 'gen') if raw_case else None
+        if gen_state is not None and gen_state.get('weights_path'):
+            weights_candidates.append(os.path.join(gen_state['weights_path'], 'gan_weights.pkl'))
+        weights_candidates.extend([
+            os.path.join('autotrain', 'many_prop_CVAE', 'weights_8p_alzhmr', 'gan_weights.pkl'),
+            os.path.join('GAN', 'gan_lstm_refactoring', 'weights', 'v4_gan_mol_124_0.0003_8k.pkl')
+        ])
+        weights_candidates = list(dict.fromkeys(weights_candidates))
 
     gan_mol = None
-    load_errors = []
+    load_errors: List[str] = []
+    loaded_from: Optional[str] = None
     for weights_path in weights_candidates:
         if not os.path.isfile(weights_path):
             continue
         try:
             with open(weights_path, "rb") as f:
                 gan_mol = pickle.load(f)
+            loaded_from = weights_path
             print(f'Loaded GAN weights from: {weights_path}')
             break
         except Exception as e:
             load_errors.append(f'{weights_path}: {e}')
 
     if gan_mol is None:
-        raise FileNotFoundError(
-            f'Could not load GAN weights. Checked: {weights_candidates}. '
-            f'Load errors: {load_errors}'
-        )
+        return {
+            "status": "weights_load_failed",
+            "case": raw_case or None,
+            "message": (
+                "Could not load any GAN weights for this generation request. "
+                f"Tried: {weights_candidates}. Load errors: {load_errors}."
+            ),
+            "weights_candidates": weights_candidates,
+            "load_errors": load_errors,
+            "weights_status": weights_status,
+        }
     
     gan_mol.eval()
     calc_props = state()["Calculateble properties"]

@@ -2,8 +2,11 @@
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
+from uuid import uuid4
 
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -118,6 +121,64 @@ def _gan_http_timeout() -> int:
     return int(os.getenv("GAN_HTTP_TIMEOUT_S", "1160"))
 
 
+def _upload_dict_as_csv_to_s3(
+    data_dict: Dict[str, Any],
+    s3_key: str,
+    expiration: int = 3600,
+) -> Dict[str, Any]:
+    """Save `data_dict` (column -> list) as a CSV and upload to S3.
+
+    Returns metadata: bucket_name, s3_key, presigned_url, expires_in, rows.
+    """
+    s3_service = _build_s3_service()
+
+    normalized_key = s3_key.replace("\\", "/").lstrip("/")
+    if "/" in normalized_key:
+        prefix, source_file_name = normalized_key.rsplit("/", 1)
+    else:
+        prefix, source_file_name = "", normalized_key
+
+    columns = list(data_dict.keys())
+    max_len = 0
+    for col in columns:
+        values = data_dict[col]
+        if hasattr(values, "__len__"):
+            max_len = max(max_len, len(values))
+
+    normalized = {}
+    for col in columns:
+        values = list(data_dict[col]) if hasattr(data_dict[col], "__iter__") and not isinstance(data_dict[col], (str, bytes)) else [data_dict[col]]
+        if len(values) < max_len:
+            values = values + [None] * (max_len - len(values))
+        elif len(values) > max_len:
+            values = values[:max_len]
+        normalized[col] = values
+
+    df = pd.DataFrame(normalized)
+
+    output_dir = Path(__file__).resolve().parent / "data" / "s3_outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    local_path = output_dir / source_file_name
+    df.to_csv(local_path, index=False)
+
+    s3_service.upload_file_object(
+        prefix=prefix,
+        source_file_name=source_file_name,
+        file_path=str(local_path),
+    )
+    presigned_url = s3_service.generate_presigned_url(
+        s3_key=normalized_key, expiration=expiration
+    )
+    return {
+        "bucket_name": s3_service.bucket_name,
+        "s3_key": normalized_key,
+        "presigned_url": presigned_url,
+        "expires_in": expiration,
+        "rows": max_len,
+        "columns": columns,
+    }
+
+
 def _normalize_s3_prefix(prefix: str) -> str:
     normalized = (prefix or "").replace("\\", "/").strip("/")
     return f"{normalized}/" if normalized else ""
@@ -217,6 +278,91 @@ def _post_generation_request(
     if not isinstance(data, dict):
         raise RuntimeError(f"Unexpected response format from {endpoint}: {type(data).__name__}")
     return data
+
+
+def _summarize_generation_result(raw_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a small dict (counts / property column names) without inline arrays."""
+    columns = list(raw_result.keys()) if isinstance(raw_result, dict) else []
+    smiles_key = None
+    for candidate in ("Smiles", "Molecules"):
+        if candidate in columns:
+            smiles_key = candidate
+            break
+    generated_count = 0
+    if smiles_key is not None and hasattr(raw_result.get(smiles_key), "__len__"):
+        generated_count = len(raw_result[smiles_key])
+    else:
+        for col in columns:
+            value = raw_result.get(col)
+            if hasattr(value, "__len__"):
+                generated_count = max(generated_count, len(value))
+    return {"generated_count": generated_count, "columns": columns}
+
+
+_GAN_ERROR_STATUSES = {
+    "case_not_found",
+    "case_not_trained",
+    "weights_not_found",
+    "weights_load_failed",
+}
+
+
+def _maybe_upload_generation_result(
+    *,
+    raw_result: Dict[str, Any],
+    case: str,
+    requested_count: int,
+    upload_results_to_s3: bool,
+    output_s3_prefix: str,
+    return_inline_results: bool,
+) -> Dict[str, Any]:
+    """Wrap a raw generation dict into an MCP response, optionally uploading CSV to S3.
+
+    If the FastAPI side reports a structured error (case not trained, weights
+    missing in S3, weights file corrupt) — propagate it as-is so the agent can
+    branch on `status` instead of treating noise as molecules.
+    """
+    case_slug = (case or "gan_default").replace("/", "_").replace("\\", "_").strip() or "gan_default"
+
+    if isinstance(raw_result, dict) and raw_result.get("status") in _GAN_ERROR_STATUSES:
+        return {
+            "case": case_slug,
+            "requested_count": int(requested_count),
+            **raw_result,
+        }
+
+    summary = _summarize_generation_result(raw_result)
+
+    response: Dict[str, Any] = {
+        "case": case_slug,
+        "status": "ok",
+        "requested_count": int(requested_count),
+        **summary,
+    }
+
+    effective_inline = return_inline_results or not upload_results_to_s3
+    if effective_inline:
+        response["results"] = raw_result
+
+    if upload_results_to_s3 and isinstance(raw_result, dict) and raw_result:
+        normalized_prefix = (output_s3_prefix or "generated").replace("\\", "/").strip("/")
+        filename = f"{uuid4().hex}.csv"
+        s3_key = f"{normalized_prefix}/{case_slug}/{filename}"
+        try:
+            upload_info = _upload_dict_as_csv_to_s3(data_dict=raw_result, s3_key=s3_key)
+            response.update({
+                "bucket_name": upload_info["bucket_name"],
+                "results_s3_key": upload_info["s3_key"],
+                "results_presigned_url": upload_info["presigned_url"],
+                "expires_in": upload_info["expires_in"],
+            })
+        except Exception as exc:
+            response["s3_upload_error"] = f"{type(exc).__name__}: {exc}"
+            if not effective_inline:
+                # Fall back to inline so the agent does not lose the data.
+                response["results"] = raw_result
+
+    return response
 
 
 @mcp.tool()
@@ -337,52 +483,75 @@ def get_state_from_server(url: str = "gen", case: Optional[str] = None) -> Union
 @mcp.tool()
 def start_generative_model_training(
     case_name: str,
-    feature_column:  List[str] = ["Smiles"],
+    train_data_url: str,
+    feature_column: List[str] = ["Smiles"],
     epochs: int = 10,
-    fine_tune: bool = True
+    fine_tune: bool = True,
+    save_trained_data_to_sync_server: bool = True,
 ) -> Dict[str, Any]:
     """
-    Starts GAN generative training with existing train dataset in s3 database for a specific case.
+    Starts GAN generative training. The training CSV is always supplied as an
+    HTTP(S) URL (e.g. an S3 presigned URL), which the training backend fetches
+    via plain `requests.get(...)`. No S3 credentials are required for the read,
+    so the URL may point at any reachable endpoint / account.
+
+    Trained weights are uploaded to S3 under
+    `gan_weights/{case_name}/train_GAN_{case_name}/...` by default
+    (`save_trained_data_to_sync_server=True`). A fresh inference container
+    will then auto-download them on the first `generate_mols(case=case_name)`.
 
     Args:
         case_name:
-            Unique case identifier used to name and track the training run. It is the same name with existing train dataset in s3 database.
-            Use `list_s3_train_cases` to get available values. Example: `Alzhmr`.
+            Unique case identifier used to name and track the training run.
+            Use `list_s3_train_cases` to discover available datasets.
+        train_data_url:
+            Required HTTP(S) URL of the training CSV — typically an S3
+            presigned URL. The training server downloads it directly; the
+            agent does not stream raw data through itself.
         feature_column:
-            list with name of feature column in downloaded CSV.
-            Example: `["Smiles"]`.
+            Name of the SMILES column in the downloaded CSV.
+            Example: `["canonical_smiles"]`.
         epochs:
-            Number of GAN training steps/epochs passed to server.
+            Number of GAN training steps/epochs.
         fine_tune:
             Whether to fine-tune existing GAN weights.
-        
+        save_trained_data_to_sync_server:
+            If True (default), trained GAN weights are uploaded to S3 under
+            `gan_weights/{case_name}/train_GAN_{case_name}/...` after
+            training finishes.
+
     Returns:
         Dict[str, Any]:
-            Metadata about submitted training request and server response.
+            Metadata about the submitted training request — `case_name`,
+            `data_url`, `weights_s3_prefix`, plus the backend response.
 
     Raises:
-        ValueError:
-            If required fields are empty.
-        RuntimeError:
-            If request to training service fails.
+        ValueError: If required fields are empty / malformed.
+        RuntimeError: If the request to the training service fails.
     """
-    case_name = case_name.strip()
-    s3_key = f'train/{case_name}.csv'
-
+    case_name = (case_name or "").strip()
     if not case_name:
         raise ValueError("case_name must not be empty")
-    if not s3_key:
-        raise ValueError("s3_key must not be empty")
     if int(epochs) < 1:
         raise ValueError("epochs must be >= 1")
 
+    resolved_url = (train_data_url or "").strip()
+    if not resolved_url:
+        raise ValueError("train_data_url must not be empty")
+    lowered = resolved_url.lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        raise ValueError(
+            "train_data_url must be an HTTP(S) URL (e.g. an S3 presigned URL); "
+            f"got: {train_data_url!r}"
+        )
 
     payload: Dict[str, Any] = {
         "case": case_name,
-        "s3_key": s3_key,
+        "data_url": resolved_url,
         "feature_column": feature_column,
         "epochs": int(epochs),
         "fine_tune": bool(fine_tune),
+        "save_trained_data_to_sync_server": bool(save_trained_data_to_sync_server),
     }
 
     response = _request_json(
@@ -392,11 +561,19 @@ def start_generative_model_training(
         timeout_s=_gan_http_timeout(),
     )
 
+    weights_s3_prefix = (
+        f"gan_weights/{case_name}/train_GAN_{case_name}/"
+        if save_trained_data_to_sync_server
+        else None
+    )
+
     result: Dict[str, Any] = {
         "case_name": case_name,
         "status": "training_started",
         "message": f"GAN training request sent for case '{case_name}'.",
-        "s3_key": s3_key,
+        "data_url": resolved_url,
+        "save_trained_data_to_sync_server": bool(save_trained_data_to_sync_server),
+        "weights_s3_prefix": weights_s3_prefix,
         "endpoint": f"{GEN_BASE_URL}/train_gan",
     }
     if response is not None:
@@ -407,40 +584,74 @@ def start_generative_model_training(
 @mcp.tool()
 def generate_mols(
     num: int = 10,
-    case: Optional[str] = None
+    case: Optional[str] = None,
+    upload_results_to_s3: bool = True,
+    output_s3_prefix: str = "generated",
+    return_inline_results: bool = False,
 ) -> Dict[str, Any]:
     """
-    Generates drug molecules and calculated properties. It uses GAN-based generator that generate molecules fast without case specific training.
-    But if you want to generate molecules from specific TRAINED case, you can use `case` parameter. In that case, it will use case-specific generator, that can generate molecules with properties similar to the ones in training data of that case.
+    Generate drug molecules with a GAN generator and exchange the result via S3.
+
+    Output contract:
+        By default the full generated table (SMILES + calculated properties)
+        is saved to S3 as a CSV under
+        `{output_s3_prefix}/{case_or_gan_default}/{uuid}.csv` and a presigned
+        URL is returned. The raw inline arrays are omitted to keep the agent
+        response small; set `return_inline_results=True` to also include them.
+
     Args:
-        num:
-            Number of molecules requested.
-            Default 10.
-        case:
-            Optional trained GAN case name. Used to generate molecules from that case by model, that trainded before.
-            If omitted, server default case behavior is used.
+        num: Number of molecules requested. Default 10.
+        case: Optional trained GAN case name (uses case-specific generator
+            that was fine-tuned before). If omitted, the generic GAN is used.
+        upload_results_to_s3: When True (default), upload the CSV with
+            generated molecules to S3 and return a presigned URL.
+        output_s3_prefix: S3 prefix for the uploaded CSV. Default `generated`.
+            Final key: `{output_s3_prefix}/{case_or_gan_default}/{uuid}.csv`.
+        return_inline_results: When True, include the raw dict of arrays in
+            the response alongside the S3 link.
+
+    Weights resolution (only when `case` is provided):
+        Before generating, the FastAPI side checks that the case-specific GAN
+        weights file is available locally. If it is missing, it tries to
+        download `gan_weights/{case}/train_GAN_{case}/...` from S3 (where
+        `start_generative_model_training` puts weights when
+        `save_trained_data_to_sync_server=True`). If neither local cache nor
+        S3 has the weights — the response carries
+        `status="case_not_trained" / "weights_not_found"` instead of
+        molecules. When `case` is omitted, the bundled fallback GAN is used
+        (no S3 lookup).
 
     Returns:
-        Dict[str, list]:
-            Dictionary of column-like arrays returned by `gan_auto_generator`.
-            Expected keys:
-            - `Smiles`
-            - `Brenk`, `QED`, `Synthetic Accessibility`, `LogP`,
-              `Polar Surface Area`, `H-bond Donors`, `H-bond Acceptors`,
-              `Rotatable Bonds`, `Aromatic Rings`, `Glaxo`, `SureChEMBL`, `PAINS`
-            - `Validity`, `Duplicates`
-            All value lists are aligned by index with `Smiles`.
+        Dict[str, Any]:
+            - `status`: `ok` / `case_not_found` / `case_not_trained` /
+              `weights_not_found` / `weights_load_failed`. The agent should
+              branch on this.
+            - `case`: case used (or `gan_default`).
+            - `requested_count`: value of `num`.
+            - On `status="ok"`: `generated_count`, `columns`,
+              `results_s3_key`, `results_presigned_url`, `expires_in`,
+              `bucket_name` (when `upload_results_to_s3=True`); `results`
+              (raw dict) when `return_inline_results=True`.
+            - On error: `message`, `s3_prefix`, `weights_dir` (where present).
 
     Raises:
-        ValueError:
-            If `num < 1`.
-        RuntimeError:
-            If generative endpoint is unavailable or returns invalid response format.
+        ValueError: If `num < 1`.
+        RuntimeError: If generative endpoint is unavailable or returns
+            invalid response format.
     """
     normalized_case = case.strip() if isinstance(case, str) else None
     if normalized_case == "":
         normalized_case = None
-    return _post_generation_request("gan_case_generator", numb_mol=num, case=normalized_case)
+
+    raw = _post_generation_request("gan_case_generator", numb_mol=num, case=normalized_case)
+    return _maybe_upload_generation_result(
+        raw_result=raw,
+        case=normalized_case or "gan_default",
+        requested_count=num,
+        upload_results_to_s3=upload_results_to_s3,
+        output_s3_prefix=output_s3_prefix,
+        return_inline_results=return_inline_results,
+    )
 
 
 def _generate_case_mols(endpoint: str, num: int) -> Dict[str, Any]:
@@ -448,16 +659,28 @@ def _generate_case_mols(endpoint: str, num: int) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def generate_case_mols(case: str, num: int = 10) -> Dict[str, Any]:
+def generate_case_mols(
+    case: str,
+    num: int = 10,
+    upload_results_to_s3: bool = True,
+    output_s3_prefix: str = "generated",
+    return_inline_results: bool = False,
+) -> Dict[str, Any]:
     """
-    Generate molecules for a selected disease case using case-specific generator.
+    Generate molecules for a selected disease case and exchange the result via S3.
 
-    Supported cases: `skleroz`, `parkinson`, `cancer`, `dyslipidemia`, `drug_resist`, `alzheimer`.
+    Output contract:
+        By default the full generated table is saved to S3 as a CSV under
+        `{output_s3_prefix}/{case}/{uuid}.csv` and a presigned URL is returned.
+        The raw inline arrays are omitted to keep the agent response small;
+        set `return_inline_results=True` to also include them.
+
+    Supported cases: `skleroz`, `parkinson`, `cancer`, `dyslipidemia`,
+    `drug_resist`, `alzheimer`.
 
     Args:
         case:
-            Disease case selector (case-insensitive).
-            Supported values:
+            Disease case selector (case-insensitive). Supported values:
             - `skleroz` -> multiple sclerosis endpoint.
             - `parkinson` -> Parkinson's disease endpoint.
             - `cancer` -> cancer endpoint.
@@ -465,27 +688,40 @@ def generate_case_mols(case: str, num: int = 10) -> Dict[str, Any]:
             - `drug_resist` -> drug-resistance endpoint.
             - `alzheimer` -> Alzheimer's disease endpoint.
         num:
-            Number of molecules requested.
-            Default: `10`.
+            Number of molecules requested. Default `10`.
             Endpoint internally caps requests above `100`.
+        upload_results_to_s3: When True (default), upload CSV with generated
+            molecules to S3 and return a presigned URL.
+        output_s3_prefix: S3 prefix for the uploaded CSV. Default `generated`.
+        return_inline_results: When True, include the raw dict alongside the
+            S3 link.
 
     Returns:
-        Dict[str, list]:
-            Case generator output with aligned lists.
-            Typical keys: `Molecules`, `QED`, `Synthetic Accessibility`, `PAINS`,
-            `SureChEMBL`, `Glaxo`, `Brenk`, `BBB`.
-            Optional keys: `IC50`, `KI`,.
+        Dict[str, Any]:
+            - `case`: case slug used in the upload path.
+            - `requested_count`: value of `num`.
+            - `generated_count`, `columns`: high-level summary.
+            - `results_s3_key`, `results_presigned_url`, `expires_in`,
+              `bucket_name`: present when `upload_results_to_s3=True`.
+            - `results`: raw inline dict, only when `return_inline_results=True`.
 
     Raises:
-        ValueError:
-            If case is not supported.
+        ValueError: If case is not supported.
     """
     case_key = (case or "").strip().lower()
     endpoint = CASE_ENDPOINTS.get(case_key)
     if endpoint is None:
         supported = ", ".join(sorted(CASE_ENDPOINTS.keys()))
         raise ValueError(f"Unsupported case '{case}'. Supported cases: {supported}")
-    return _generate_case_mols(endpoint, num)
+    raw = _generate_case_mols(endpoint, num)
+    return _maybe_upload_generation_result(
+        raw_result=raw,
+        case=case_key,
+        requested_count=num,
+        upload_results_to_s3=upload_results_to_s3,
+        output_s3_prefix=output_s3_prefix,
+        return_inline_results=return_inline_results,
+    )
 
 
 if __name__ == "__main__":

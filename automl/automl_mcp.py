@@ -10,7 +10,14 @@ from dotenv import load_dotenv
 
 from fastmcp import FastMCP
 
-from api_utils import MLData, inference_ml, train_ml_with_data
+from api_utils import (
+    MLData,
+    download_smiles_csv_from_s3,
+    ensure_ml_weights_available,
+    inference_ml,
+    train_ml_with_data,
+    upload_predictions_csv_to_s3,
+)
 from utils.base_state import TrainState
 
 try:
@@ -31,6 +38,40 @@ STATE_FILE = "state.json"
 mcp = FastMCP("automl-mcp")
 _TRAIN_JOBS: Dict[str, Process] = {}
 _TRAIN_JOB_META: Dict[str, Dict[str, Any]] = {}
+
+
+def _normalize_s3_uri_to_key(s3_uri_or_key: Optional[str]) -> Optional[str]:
+    """Normalize either `s3://bucket/key` or plain key to a bucket-relative key."""
+    if not s3_uri_or_key:
+        return None
+    raw = s3_uri_or_key.strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("s3://"):
+        without_scheme = raw[len("s3://"):]
+        _, _, key_part = without_scheme.partition("/")
+        normalized = key_part
+    else:
+        normalized = raw
+    normalized = normalized.replace("\\", "/").lstrip("/")
+    return normalized or None
+
+
+def _read_smiles_from_local_csv(local_csv_path: str, smiles_column: str) -> List[str]:
+    """Read SMILES strings from a column in a downloaded CSV file."""
+    try:
+        df = pd.read_csv(local_csv_path)
+    except Exception:
+        # Fallback for uncommon delimiters.
+        df = pd.read_csv(local_csv_path, sep=None, engine="python")
+    if smiles_column not in df.columns:
+        raise ValueError(
+            f"Column '{smiles_column}' not found in CSV. "
+            f"Available columns: {df.columns.tolist()}"
+        )
+    series = df[smiles_column].dropna().astype(str).str.strip()
+    series = series[series != ""]
+    return series.tolist()
 
 
 def _normalize_s3_prefix(prefix: str) -> str:
@@ -277,25 +318,46 @@ def check_state() -> dict[str, Any]:
 @mcp.tool()
 def train_ml(
     case: str,
+    train_data_url: str,
     target_column: Optional[List[str]] = None,
     feature_column: Optional[List[str]] = None,
     description: str = "Unknown case.",
     regression_props: Optional[List[str]] = None,
     classification_props: Optional[List[str]] = None,
+    save_trained_data_to_sync_server: bool = True,
 ) -> dict[str, Any]:
     """Train AutoML pipelines for molecule property prediction by specific case.
 
-    Training may take from minutes to hours depending on dataset size and resources.
-    The tool starts training in a background process and returns immediately with `job_id`.
+    The training CSV is always supplied as an HTTP(S) URL (e.g. an S3 presigned
+    URL), which the training backend fetches via plain `requests.get(...)`.
+    No S3 credentials are required for the read, so the URL may point at any
+    reachable endpoint / account.
+
+    Trained model artifacts are uploaded to S3 under
+    `ml_weights/{case}/trained_data_{case}_{problem}/...` by default
+    (`save_trained_data_to_sync_server=True`). This makes it possible to spin
+    up a fresh inference container and have `predict_ml` automatically
+    download the weights on demand. Set the flag to `False` to keep weights
+    only on the local filesystem of the training container.
+
+    Training runs in a background process — the tool returns immediately with
+    `job_id`. Use `train_ml_job_status` to poll status.
 
     Args:
-        case: Case identifier. Should be unique for each training dataset and will be used to reference the trained model for inference. and it is similar to trian dataset name.
+        case: Case identifier. Should be unique for each training dataset and
+            will be used to reference the trained model for inference.
+        train_data_url: Required HTTP(S) URL of the training CSV — typically
+            an S3 presigned URL. The training server downloads it directly;
+            the agent does not stream raw data through itself.
         target_column: Target column names for prediction.
         feature_column: Feature column names, default is `['Smiles']`.
         description: Case description.
         regression_props: Regression targets.
         classification_props: Classification targets.
-
+        save_trained_data_to_sync_server: If True (default), trained model
+            artifacts are uploaded to S3 under
+            `ml_weights/{case}/trained_data_{case}_{problem}/...` after
+            training finishes.
 
     Returns:
         Dictionary with async start metadata:
@@ -304,11 +366,28 @@ def train_ml(
         - `job_id`: background training job id
         - `pid`: OS process id
         - `started_at`: UTC timestamp
+        - `data_url`: training CSV URL submitted to the backend
+        - `weights_s3_root`: S3 prefix where trained artifacts will be
+          uploaded after training (always present, but actually written
+          only when `save_trained_data_to_sync_server=True`).
+        - `weights_s3_prefixes`: per-problem S3 prefixes that `predict_ml`
+          looks at when downloading weights into a fresh container.
     """
+    resolved_url = (train_data_url or "").strip()
+    if not resolved_url:
+        raise ValueError("train_data_url must not be empty")
+    lowered = resolved_url.lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        raise ValueError(
+            "train_data_url must be an HTTP(S) URL (e.g. an S3 presigned URL); "
+            f"got: {train_data_url!r}"
+        )
+
     payload_data_raw: dict[str, Any] = {
         "case": case,
         "description": description,
-        
+        "save_trained_data_to_sync_server": bool(save_trained_data_to_sync_server),
+        "data_url": resolved_url,
     }
     if target_column is not None:
         payload_data_raw["target_column"] = target_column
@@ -334,13 +413,30 @@ def train_ml(
         "started_at": started_at,
     }
 
-    return {
+    expected_problems: List[str] = []
+    if regression_props:
+        expected_problems.append("regression")
+    if classification_props:
+        expected_problems.append("classification")
+
+    weights_s3_root = f"ml_weights/{payload.case}/"
+    weights_s3_prefixes = {
+        problem: f"{weights_s3_root}trained_data_{payload.case}_{problem}/"
+        for problem in expected_problems
+    }
+
+    result: Dict[str, Any] = {
         "status": "accepted",
         "case": payload.case,
         "job_id": job_id,
         "pid": process.pid,
         "started_at": started_at,
+        "data_url": resolved_url,
+        "save_trained_data_to_sync_server": bool(save_trained_data_to_sync_server),
+        "weights_s3_root": weights_s3_root,
+        "weights_s3_prefixes": weights_s3_prefixes,
     }
+    return result
 
 
 @mcp.tool()
@@ -379,30 +475,204 @@ def train_ml_job_status(job_id: str) -> dict[str, Any]:
 @mcp.tool()
 def predict_ml(
     case: str,
-    smiles_list: List[str],
+    smiles_list: Optional[List[str]] = None,
+    input_s3_key: Optional[str] = None,
+    smiles_column: str = "Smiles",
+    upload_predictions_to_s3: bool = True,
+    output_s3_prefix: str = "predictions",
+    return_inline_predictions: bool = False,
     timeout: int = 30,
-) -> Any:
-    """Run AutoML inference for SMILES list in an existing case.
+) -> Dict[str, Any]:
+    """Run AutoML inference and exchange data with the agent via S3 links.
 
-    Runs inference for a list of SMILES strings in a selected case. Before
-    inference, refreshes shared `state.json` from S3.
+    Input options (provide exactly one):
+        - `smiles_list`: inline list of SMILES strings.
+        - `input_s3_key`: S3 key (or `s3://bucket/key` URI) pointing to a CSV
+          file with a SMILES column. The MCP server downloads it and reads
+          column `smiles_column`.
+
+    Output:
+        Predictions are saved to S3 as a CSV under
+        `{output_s3_prefix}/{case}/{uuid}.csv` and a presigned URL is returned
+        in the response. The raw inline dict is omitted by default to keep
+        the agent response small; set `return_inline_predictions=True` to also
+        include the full predictions inline.
 
     Args:
         case: Trained case name.
-        smiles_list: Molecules in SMILES format.
-        timeout: Optional timeout in minutes.
+        smiles_list: Optional inline SMILES list.
+        input_s3_key: Optional S3 key/URI to a CSV with SMILES.
+        smiles_column: Column name with SMILES when reading `input_s3_key`.
+            Default `"Smiles"`.
+        upload_predictions_to_s3: When True (default), upload the predictions
+            CSV to S3 and return a presigned URL. When False, only inline
+            predictions are returned (`return_inline_predictions` is forced
+            to True in that case).
+        output_s3_prefix: S3 prefix for uploaded predictions CSV.
+            Default `"predictions"`. Final key:
+            `{output_s3_prefix}/{case}/{uuid}.csv`.
+        return_inline_predictions: When True, include the raw predictions
+            dictionary alongside the S3 link.
+        timeout: Optional timeout in minutes (passed through to MLData).
+
+    Weights resolution:
+        Before running inference the tool checks that trained pipelines for
+        every predictable problem of the case are available locally. If they
+        are missing it tries to download them from
+        `s3://{bucket}/ml_weights/{case}/...` (where training puts them when
+        called with `save_trained_data_to_sync_server=True`). If neither
+        local cache nor S3 has the weights the tool returns a structured
+        error response (`status="weights_not_found"` /
+        `status="case_not_found"`) instead of raising.
 
     Returns:
-        Inference result from `inference_ml(...)`. The structure depends on the
-        trained case and available predictors.
+        Dict with:
+            - `status`: `ok` / `case_not_found` / `weights_not_found` /
+              `no_predictable_properties` / `weights_load_failed` /
+              `inference_failed`. The agent should branch on this.
+            - `case`: trained case name.
+            - `input_smiles_count`: number of input SMILES received.
+            - On success (`status="ok"`):
+                - `predicted_row_count`: rows in the predictions CSV.
+                - `property_columns`: predicted property column names.
+                - `weights_downloaded_from_s3`: list of problems whose weights
+                  were freshly fetched from S3 during this call.
+                - `predictions_s3_key`, `predictions_presigned_url`,
+                  `expires_in`, `bucket_name`: present when
+                  `upload_predictions_to_s3=True`.
+                - `predictions`: raw dict, only when
+                  `return_inline_predictions=True`.
+            - On failure: `message`, `problems_missing`,
+              `problems_downloaded`, `problems_checked`, `weights_details`.
 
     Raises:
-        pydantic.ValidationError: if payload format does not match `MLData`.
-        Any exception propagated by inference or S3 sync logic.
+        ValueError: if neither or both input forms are given, or if the SMILES
+            column is missing in the input CSV.
     """
-    payload = MLData(case=case, smiles_list=smiles_list, timeout=timeout)
+    if (smiles_list is None or len(smiles_list) == 0) and not input_s3_key:
+        raise ValueError("Provide either `smiles_list` or `input_s3_key`.")
+    if smiles_list and input_s3_key:
+        raise ValueError("Provide only one of `smiles_list` or `input_s3_key`.")
+
+    payload = MLData(case=case, timeout=timeout)
+
+    if input_s3_key:
+        normalized_in_key = _normalize_s3_uri_to_key(input_s3_key)
+        if not normalized_in_key:
+            raise ValueError(f"`input_s3_key` is invalid: {input_s3_key!r}")
+        download_dir = IMPORT_PATH / "data" / "s3_inputs"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        local_input = download_dir / f"{uuid4().hex}.csv"
+        download_smiles_csv_from_s3(
+            data=payload,
+            s3_key_or_uri=normalized_in_key,
+            local_csv_path=str(local_input),
+        )
+        resolved_smiles = _read_smiles_from_local_csv(
+            local_csv_path=str(local_input),
+            smiles_column=smiles_column,
+        )
+    else:
+        resolved_smiles = [str(s).strip() for s in (smiles_list or []) if str(s).strip()]
+
+    if not resolved_smiles:
+        raise ValueError("No SMILES strings resolved from inputs.")
+
+    payload.smiles_list = resolved_smiles
     _sync_state_from_s3()
-    return inference_ml(payload)
+
+    weights_status = ensure_ml_weights_available(payload)
+    if weights_status.get("status") != "ok":
+        return {
+            "case": case,
+            "status": weights_status.get("status", "weights_check_failed"),
+            "message": weights_status.get(
+                "message",
+                f"Trained weights for case '{case}' are not available.",
+            ),
+            "input_smiles_count": len(resolved_smiles),
+            "problems_checked": weights_status.get("problems_checked", []),
+            "problems_downloaded": weights_status.get("problems_downloaded", []),
+            "problems_missing": weights_status.get("problems_missing", []),
+            "weights_details": weights_status.get("details", {}),
+        }
+
+    try:
+        predictions = inference_ml(payload)
+    except FileNotFoundError as exc:
+        return {
+            "case": case,
+            "status": "weights_load_failed",
+            "message": (
+                "Pipeline files were located but could not be loaded. "
+                "The cached/downloaded weights folder may be incomplete or corrupt. "
+                f"Error: {exc}"
+            ),
+            "input_smiles_count": len(resolved_smiles),
+            "weights_details": weights_status.get("details", {}),
+        }
+    except Exception as exc:
+        return {
+            "case": case,
+            "status": "inference_failed",
+            "message": f"Inference failed: {type(exc).__name__}: {exc}",
+            "input_smiles_count": len(resolved_smiles),
+            "weights_details": weights_status.get("details", {}),
+        }
+
+    if not isinstance(predictions, dict):
+        # Defensive: keep the wrapping consistent even if downstream changes.
+        predictions = {"value": list(predictions) if hasattr(predictions, "__iter__") else [predictions]}
+
+    property_columns = list(predictions.keys())
+    predicted_row_count = max((len(v) if hasattr(v, "__len__") else 0 for v in predictions.values()), default=0)
+
+    result: Dict[str, Any] = {
+        "case": case,
+        "status": "ok",
+        "input_smiles_count": len(resolved_smiles),
+        "predicted_row_count": predicted_row_count,
+        "property_columns": property_columns,
+        "weights_downloaded_from_s3": weights_status.get("problems_downloaded", []),
+    }
+
+    effective_inline = return_inline_predictions or not upload_predictions_to_s3
+    if effective_inline:
+        result["predictions"] = predictions
+
+    if upload_predictions_to_s3:
+        normalized_prefix = (output_s3_prefix or "predictions").replace("\\", "/").strip("/")
+        case_slug = (case or "case").replace("/", "_").replace("\\", "_").strip() or "case"
+        filename = f"{uuid4().hex}.csv"
+        s3_key = f"{normalized_prefix}/{case_slug}/{filename}"
+
+        output_dir = IMPORT_PATH / "data" / "s3_outputs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        local_output = output_dir / filename
+
+        normalized_predictions = {col: list(vals) for col, vals in predictions.items()}
+        if predicted_row_count > 0:
+            for col, vals in normalized_predictions.items():
+                if len(vals) < predicted_row_count:
+                    vals.extend([None] * (predicted_row_count - len(vals)))
+                elif len(vals) > predicted_row_count:
+                    normalized_predictions[col] = vals[:predicted_row_count]
+        df = pd.DataFrame(normalized_predictions)
+        df.to_csv(local_output, index=False)
+
+        upload_info = upload_predictions_csv_to_s3(
+            data=payload,
+            local_csv_path=str(local_output),
+            s3_key=s3_key,
+        )
+        result.update({
+            "bucket_name": upload_info["bucket_name"],
+            "predictions_s3_key": upload_info["s3_key"],
+            "predictions_presigned_url": upload_info["presigned_url"],
+            "expires_in": upload_info["expires_in"],
+        })
+
+    return result
 
 
 if __name__ == "__main__":

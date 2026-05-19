@@ -1,0 +1,15 @@
+# Runtime secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local data and trained artifacts
+data/
+trained_data_*/
+train_model_data/
+ML_models*/
