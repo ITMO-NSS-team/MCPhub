@@ -366,17 +366,22 @@ def _maybe_upload_generation_result(
 
 
 @mcp.tool()
-def list_s3_train_cases(
+def list_generative_train_cases(
     prefix: str = "train/",
     extension: str = ".csv",
 ) -> Dict[str, Any]:
     """
-    Lists S3 objects and resolves dataset names (`case_name`) for MCP training workflows.
+    Lists S3 objects and resolves dataset names (`case_name`) for GAN training.
+
+    This is the Generative (`GenerativeModelsMCP`) server's view of the shared
+    bucket. The AutoML server exposes a functionally equivalent
+    `list_automl_train_cases` against the same bucket — pick whichever server
+    you are already talking to; the result is identical.
 
     Main purpose:
         Find training dataset files for the MCP server of generative and predictive molecular models.
         By default, this tool searches inside `train/` because `start_generative_model_training`
-        expects datasets at `train/{case_name}.csv`.
+        and `train_ml` expect datasets at `train/{case_name}.csv`.
 
     Prefix behavior:
         - Default (`prefix="train/"`): standard mode for training dataset discovery.
@@ -495,6 +500,13 @@ def start_generative_model_training(
     via plain `requests.get(...)`. No S3 credentials are required for the read,
     so the URL may point at any reachable endpoint / account.
 
+    BLOCKING call. Unlike `train_ml` (which spawns a background process and
+    returns a `job_id` immediately), this tool issues a synchronous HTTP
+    request to the FastAPI backend and waits for training to finish — up to
+    `GAN_HTTP_TIMEOUT_S` seconds (default ~19 min). There is no `job_id` and
+    nothing to poll; success/failure is reported in the response. Plan
+    surrounding tool calls accordingly.
+
     Trained weights are uploaded to S3 under
     `gan_weights/{case_name}/train_GAN_{case_name}/...` by default
     (`save_trained_data_to_sync_server=True`). A fresh inference container
@@ -590,7 +602,41 @@ def generate_mols(
     return_inline_results: bool = False,
 ) -> Dict[str, Any]:
     """
-    Generate drug molecules with a GAN generator and exchange the result via S3.
+    Generic, FAST GAN molecule generator. Default tool for "give me N drug-like
+    molecules" requests when no disease-specific tuning is required. Its generate good molecules fast, when training is timeconsuming or unavailable — for example, when the agent is exploring a new case and has not trained a GAN yet or has no train data.
+
+    Model: GAN-LSTM (`gan_auto_generator` on the FastAPI side). One forward
+    pass per batch — no iterative novelty/property filtering loop, no docking,
+    no IC50 evaluation. Returns the SMILES plus a fixed set of RDKit-computed
+    properties (`QED`, `LogP`, `Synthetic Accessibility`, `Brenk`, `PAINS`,
+    `Glaxo`, `SureChEMBL`, `Polar Surface Area`, H-bond/Rotatable/Aromatic
+    counters, `Validity`, `Duplicates`).
+
+    Two operating modes:
+
+    1. Generic mode (`case` omitted) — uses the bundled fallback GAN weights
+       shipped with the image (`GAN/gan_lstm_refactoring/weights/
+       v4_gan_mol_124_0.0003_8k.pkl`, pulled from HuggingFace at build time).
+       No S3 lookup, no case state required. This is the right tool for any
+       case that does NOT already have a fine-tuned GAN.
+
+    2. Case-specific mode (`case` provided) — STRICT: weights MUST be the
+       case-specific ones produced by `start_generative_model_training`. If
+       missing locally, the FastAPI side tries to download
+       `gan_weights/{case}/train_GAN_{case}/...` from S3. If neither local
+       cache nor S3 has them, the response carries
+       `status="case_not_trained" / "weights_not_found" / "weights_load_failed"`
+       — there is NO silent fallback to the generic GAN.
+
+    Typical agent workflow: `generate_mols(num=...)` → pipe SMILES into
+    `predict_ml(case=..., smiles_list=...)` for property prediction. If the
+    results are insufficient, request more molecules — no retraining needed.
+
+    For the 6 hard-coded disease cases (alzheimer, parkinson, cancer,
+    skleroz, dyslipidemia, drug_resist) prefer `generate_case_mols` — it
+    runs a different, slower model (multi-property CVAE) tuned for those
+    targets with property constraints. Do NOT use those names here unless
+    you have separately trained a GAN under that case name.
 
     Output contract:
         By default the full generated table (SMILES + calculated properties)
@@ -600,26 +646,15 @@ def generate_mols(
         response small; set `return_inline_results=True` to also include them.
 
     Args:
-        num: Number of molecules requested. Default 10.
-        case: Optional trained GAN case name (uses case-specific generator
-            that was fine-tuned before). If omitted, the generic GAN is used.
+        num: Number of molecules requested. Default 10. No hard cap.
+        case: Optional trained-GAN case name (see "Case-specific mode" above).
+            Omit for the generic GAN.
         upload_results_to_s3: When True (default), upload the CSV with
             generated molecules to S3 and return a presigned URL.
         output_s3_prefix: S3 prefix for the uploaded CSV. Default `generated`.
             Final key: `{output_s3_prefix}/{case_or_gan_default}/{uuid}.csv`.
         return_inline_results: When True, include the raw dict of arrays in
             the response alongside the S3 link.
-
-    Weights resolution (only when `case` is provided):
-        Before generating, the FastAPI side checks that the case-specific GAN
-        weights file is available locally. If it is missing, it tries to
-        download `gan_weights/{case}/train_GAN_{case}/...` from S3 (where
-        `start_generative_model_training` puts weights when
-        `save_trained_data_to_sync_server=True`). If neither local cache nor
-        S3 has the weights — the response carries
-        `status="case_not_trained" / "weights_not_found"` instead of
-        molecules. When `case` is omitted, the bundled fallback GAN is used
-        (no S3 lookup).
 
     Returns:
         Dict[str, Any]:
@@ -667,7 +702,39 @@ def generate_case_mols(
     return_inline_results: bool = False,
 ) -> Dict[str, Any]:
     """
-    Generate molecules for a selected disease case and exchange the result via S3.
+    Generate molecules for a HARDCODED disease case using a multi-property
+    conditional VAE — SLOWER but tuned for specific therapeutic targets.
+
+    Model: 8-property conditional CVAE (`multi_generator` on the FastAPI side
+    invoked through one of the `/search_*` endpoints) with case-specific
+    pre-bundled weights:
+
+        alzheimer    -> autotrain/many_prop_CVAE/weights_8p_alzhmr/
+        skleroz      -> autotrain/many_prop_CVAE/weights_8p_sklrz/
+        cancer       -> autotrain/many_prop_CVAE/weights_8p_cnsr/
+        parkinson    -> autotrain/many_prop_CVAE/weights_parkinson/
+        dyslipidemia -> autotrain/many_prop_CVAE/weights_dislip/
+        drug_resist  -> autotrain/many_prop_CVAE/weights_8p_tablet/
+
+    Unlike `generate_mols`, the backend applies property constraints
+    (`spec_conds` — windows on docking_score, QED, Synthetic Accessibility,
+    PAINS/SureChEMBL/Glaxo/Brenk flags) and ITERATIVELY regenerates until
+    enough valid + novel molecules accumulate. Novelty is checked against the
+    disease-specific ChEMBL training set
+    (`docked_data_for_train/data_*.csv`). Because of this loop, latency is
+    significantly higher than `generate_mols` — expect tens of seconds to a
+    few minutes for a full batch.
+
+    When to use this tool vs `generate_mols`:
+        - Use `generate_case_mols` ONLY for the 6 cases listed above and only
+          when you need property-constrained, case-tuned molecules (typical
+          for lead-discovery / SAR workflows).
+        - For any other target, fast generic generation, or when you just
+          need raw SMILES to feed into `predict_ml`, use `generate_mols`
+          (universal GAN, no constraints, no per-case weights required).
+
+    Hard cap: the FastAPI side enforces `numb_mol <= 100` per request — any
+    larger value is silently clamped to 100.
 
     Output contract:
         By default the full generated table is saved to S3 as a CSV under
@@ -675,21 +742,18 @@ def generate_case_mols(
         The raw inline arrays are omitted to keep the agent response small;
         set `return_inline_results=True` to also include them.
 
-    Supported cases: `skleroz`, `parkinson`, `cancer`, `dyslipidemia`,
-    `drug_resist`, `alzheimer`.
-
     Args:
         case:
             Disease case selector (case-insensitive). Supported values:
-            - `skleroz` -> multiple sclerosis endpoint.
-            - `parkinson` -> Parkinson's disease endpoint.
-            - `cancer` -> cancer endpoint.
-            - `dyslipidemia` -> dyslipidemia endpoint.
-            - `drug_resist` -> drug-resistance endpoint.
-            - `alzheimer` -> Alzheimer's disease endpoint.
+            - `skleroz` -> multiple sclerosis (BTK target).
+            - `parkinson` -> Parkinson's disease (tyrosine-protein kinase ABL).
+            - `cancer` -> cancer (8afb protein).
+            - `dyslipidemia` -> dyslipidemia (ATP citrate synthase).
+            - `drug_resist` -> drug-resistance ("tablet" weights).
+            - `alzheimer` -> Alzheimer's disease (4j1r target).
         num:
-            Number of molecules requested. Default `10`.
-            Endpoint internally caps requests above `100`.
+            Number of molecules requested. Default `10`. Backend hard-caps
+            at 100 — larger values are silently truncated.
         upload_results_to_s3: When True (default), upload CSV with generated
             molecules to S3 and return a presigned URL.
         output_s3_prefix: S3 prefix for the uploaded CSV. Default `generated`.

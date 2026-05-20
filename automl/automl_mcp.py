@@ -166,17 +166,22 @@ def _train_ml_worker(payload_data: dict[str, Any]) -> None:
 
 
 @mcp.tool()
-def list_s3_train_cases(
+def list_automl_train_cases(
     prefix: str = "train/",
     extension: str = ".csv",
 ) -> Dict[str, Any]:
     """
-    Lists S3 objects and resolves dataset names (`case_name`) for MCP training workflows.
+    Lists S3 objects and resolves dataset names (`case_name`) for AutoML training.
+
+    This is the AutoML (`automl-mcp`) server's view of the shared bucket. The
+    Generative server exposes a functionally equivalent
+    `list_generative_train_cases` against the same bucket — pick whichever
+    server you are already talking to; the result is identical.
 
     Main purpose:
         Find training dataset files for the MCP server of generative and predictive molecular models.
         By default, this tool searches inside `train/` because `start_generative_model_training`
-        expects datasets at `train/{case_name}.csv`.
+        and `train_ml` expect datasets at `train/{case_name}.csv`.
 
     Prefix behavior:
         - Default (`prefix="train/"`): standard mode for training dataset discovery.
@@ -343,17 +348,47 @@ def train_ml(
     Training runs in a background process — the tool returns immediately with
     `job_id`. Use `train_ml_job_status` to poll status.
 
+    Required: at least ONE of `regression_props` / `classification_props` must
+    be supplied — these drive what is actually fitted. If both are omitted the
+    job completes with `exitcode 0` and the case is marked `Trained`, but no
+    Fedot pipeline is produced and subsequent `predict_ml` calls return
+    `status: "no_predictable_properties"`. `target_column` alone is NOT enough
+    — it is stored as metadata only and does not trigger training.
+
+    Calculable properties are silently filtered out. Any property name that
+    appears in the bundled calculable list (e.g. `LogP`, `QED`,
+    `Synthetic Accessibility`, `PAINS`, `Brenk`, `Glaxo`, `SureChEMBL`,
+    `Validity`, `Polar Surface Area`, `H-bond Donors`, `H-bond Acceptors`,
+    `Rotatable Bonds`, `Aromatic Rings`) is removed from
+    `regression_props` / `classification_props` before training, because
+    these are computed directly from SMILES via RDKit at inference time and
+    do not need a learned model. Pass only experimental / non-calculable
+    targets (`docking_score`, `IC50`, `Ki`, `Minimum Energy`, custom assay
+    columns, etc.). Use `check_state()` → `calc_propreties` to see the full
+    bundled list.
+
     Args:
         case: Case identifier. Should be unique for each training dataset and
             will be used to reference the trained model for inference.
         train_data_url: Required HTTP(S) URL of the training CSV — typically
             an S3 presigned URL. The training server downloads it directly;
             the agent does not stream raw data through itself.
-        target_column: Target column names for prediction.
+        target_column: Names of target columns from the CSV. Stored in state
+            as metadata; does NOT by itself launch a training job. To fit a
+            model, also pass the same names into `regression_props` or
+            `classification_props`.
         feature_column: Feature column names, default is `['Smiles']`.
-        description: Case description.
-        regression_props: Regression targets.
-        classification_props: Classification targets.
+            Note: most curated datasets use `canonical_smiles`, not `Smiles`
+            — verify against the dataset (e.g. `get_s3_train_case_columns`)
+            and pass the exact column name if it differs.
+        description: Free-text case description. Saved into state.json under
+            the case entry. Has no effect on training itself; the agent
+            should use it to record the task context (dataset origin,
+            intended use, target rationale, dataset version) so future MCP
+            calls can recall what this case was trained for.
+        regression_props: Regression target columns. See "Required" /
+            "Calculable properties" notes above.
+        classification_props: Classification target columns. Same rules apply.
         save_trained_data_to_sync_server: If True (default), trained model
             artifacts are uploaded to S3 under
             `ml_weights/{case}/trained_data_{case}_{problem}/...` after
