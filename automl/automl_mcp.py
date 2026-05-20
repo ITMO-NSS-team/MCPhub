@@ -483,13 +483,11 @@ def predict_ml(
     return_inline_predictions: bool = False,
     timeout: int = 30,
 ) -> Dict[str, Any]:
-    """Run AutoML inference and exchange data with the agent via S3 links.
+    """Run AutoML model inference for a given case to predict molecular properties.
 
     Input options (provide exactly one):
-        - `smiles_list`: inline list of SMILES strings.
-        - `input_s3_key`: S3 key (or `s3://bucket/key` URI) pointing to a CSV
-          file with a SMILES column. The MCP server downloads it and reads
-          column `smiles_column`.
+        - `smiles_list`: list of SMILES molecules.
+        
 
     Output:
         Predictions are saved to S3 as a CSV under
@@ -501,7 +499,6 @@ def predict_ml(
     Args:
         case: Trained case name.
         smiles_list: Optional inline SMILES list.
-        input_s3_key: Optional S3 key/URI to a CSV with SMILES.
         smiles_column: Column name with SMILES when reading `input_s3_key`.
             Default `"Smiles"`.
         upload_predictions_to_s3: When True (default), upload the predictions

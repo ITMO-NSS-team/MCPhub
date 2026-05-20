@@ -20,6 +20,41 @@ try:
 except ModuleNotFoundError:
     from .s3_utils import S3BucketService, s3_service as default_s3_service
 
+
+_TRAIN_DATA_SIZE_LIMITS: Dict[str, Optional[int]] = {
+    "TEST": 200,
+    "LIMITED_DEV": 10_000,
+    "UNLIMITED": None,
+}
+DEFAULT_TRAIN_DATA_LIMIT_MODE = "LIMITED_DEV"
+
+
+def _resolve_train_data_size_limit() -> Optional[int]:
+    raw = (os.getenv("TRAIN_DATA_LIMIT") or DEFAULT_TRAIN_DATA_LIMIT_MODE).strip().upper()
+    if raw not in _TRAIN_DATA_SIZE_LIMITS:
+        raise ValueError(
+            f"Unknown TRAIN_DATA_LIMIT={raw!r}. "
+            f"Expected one of: {sorted(_TRAIN_DATA_SIZE_LIMITS)}"
+        )
+    return _TRAIN_DATA_SIZE_LIMITS[raw]
+
+
+def _apply_train_data_size_limit(df: pd.DataFrame) -> pd.DataFrame:
+    """Cap row count of a training DataFrame per `TRAIN_DATA_LIMIT` env var.
+
+    Modes: `TEST` (200), `LIMITED_DEV` (10 000), `UNLIMITED` (no cap).
+    Default: `LIMITED_DEV`. Guards against OOM on low-memory hosts.
+    """
+    limit = _resolve_train_data_size_limit()
+    if limit is None:
+        print(f"TRAIN_DATA_LIMIT=UNLIMITED: keeping all {len(df)} rows")
+        return df
+    if len(df) <= limit:
+        print(f"TRAIN_DATA_LIMIT cap={limit}: dataset has {len(df)} rows, keeping all")
+        return df
+    print(f"TRAIN_DATA_LIMIT cap={limit}: truncating dataset from {len(df)} to {limit} rows")
+    return df.head(limit)
+
 class MLData(BaseModel):
         """
         Represents a container for machine learning data, handling loading, processing, and storage.
@@ -184,7 +219,7 @@ def train_ml_with_data(data:MLData=Body()):
                     f"Feature column '{data.feature_column[0]}' not found in downloaded file. "
                     f"Available columns: {df.columns.tolist()}"
                 )
-            #df = df[df[data.feature_column[0]].astype(str).str.len() < 200]
+            df = _apply_train_data_size_limit(df)
             df.to_csv(data.data_path, index=False)
     elif data.data is not None:
             df = pd.DataFrame(data.data)
@@ -193,8 +228,8 @@ def train_ml_with_data(data:MLData=Body()):
             data.data_path = f"data/{data.case}/data.csv"
             os.makedirs(os.path.dirname(data.data_path), exist_ok=True)
             df = df.dropna()
-            #df = df[df[data.feature_column[0]].astype(str).str.len()<200]
-            df.to_csv(data.data_path, index=False) 
+            df = _apply_train_data_size_limit(df)
+            df.to_csv(data.data_path, index=False)
                     
     state.ml_model_upd_data(case=data.case,
                             data_path=data.data_path,

@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c ' *)",
-      "Bash(python d:/Projects/mcp/MCPhub/.claude/scratch/train_ml_test_link.py)"
-    ]
-  }
-}
