@@ -25,8 +25,8 @@ COPY . ./
 
 # Runtime configuration (S3 credentials, ports, state key, etc.) is provided
 # via a `.env` file at container start time. See `.env.example` for the full
-# list of variables and `docker-compose.yml` (env_file: .env) for wiring.
-# Python-dotenv (`load_dotenv()` in automl_mcp.py / s3_utils.py) reads it from
-# the WORKDIR (/app/automl/.env). Alternatively use `docker run --env-file .env`.
+# list of variables. Pass it in with `docker run --env-file .env`, or rely on
+# python-dotenv (`load_dotenv()` in automl_mcp.py / s3_utils.py), which reads
+# the file from the WORKDIR (/app/automl/.env).
 
 ENTRYPOINT ["python", "automl_mcp.py"]

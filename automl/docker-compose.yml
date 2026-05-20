@@ -1,7 +1,0 @@
-services:
-  automl-mcp-server:
-    build: .
-    env_file:
-      - .env
-    restart: unless-stopped
-    network_mode: host

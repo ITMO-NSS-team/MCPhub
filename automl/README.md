@@ -39,16 +39,7 @@ The image is reusable across environments — same image, different `.env`.
 
 ### 3. Run
 
-Pick one of:
-
-**docker compose (recommended)** — picks up `.env` automatically via the
-`env_file:` directive in `docker-compose.yml`:
-
-```bash
-docker compose up -d --build
-```
-
-**docker run** — pass `.env` explicitly:
+Pass `.env` explicitly:
 
 ```bash
 docker run --name automl_mcp_server \
@@ -124,11 +115,9 @@ instead of raising — the agent can branch on `status`.
 After pulling new code, rebuild and restart:
 
 ```bash
-docker compose up -d --build
-# or, if running via `docker run`:
 docker build -t automl_mcp .
 docker rm -f automl_mcp_server 2>/dev/null
-docker run --name automl_mcp_server --rm --env-file .env -p 8777:8777 automl_mcp
+docker run --name automl_mcp_server --env-file .env -p 8777:8777 automl_mcp
 ```
 
 `.env` changes alone do **not** propagate into a running container — restart

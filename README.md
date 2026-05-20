@@ -18,18 +18,12 @@ in a per-project `.env`, the Dockerfile is image-portable:
 ```bash
 cd <project_dir>          # automl, SMILES_generative_models, or chemical_mcp
 cp .env.example .env      # then fill in S3 / HF / port values
-docker compose up -d --build
-```
-
-Or with plain `docker run`:
-
-```bash
 docker build -t <image_name> .
 docker run --env-file .env -p <host_port>:<container_port> <image_name>
 ```
 
 See each project's README for project-specific build flags (GPU reservation
-for `SMILES_generative_models`, compose profiles for `chemical_mcp`, etc.).
+for `SMILES_generative_models`, etc.).
 
 ## S3 exchange protocol
 

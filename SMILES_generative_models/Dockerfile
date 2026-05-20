@@ -64,11 +64,10 @@ RUN HF_TOKEN="$HF_TOK" ~/miniconda3/envs/Mol_gen_env/bin/huggingface-cli downloa
 
 # Non-secret runtime path setup. All secrets and runtime config (S3 creds,
 # HF_TOKEN, ports, ML_MOLS_MODEL_APP_URL, ...) come from a `.env` file at
-# container start time. See `.env.example` for the full list and
-# `docker-compose.yml` (env_file: .env) for wiring. Python-dotenv
-# (`load_dotenv()` in main_mcp.py / main_api.py) reads it from the WORKDIR
-# (/projects/generative_models/.env). Alternatively use
-# `docker run --env-file .env`.
+# container start time. See `.env.example` for the full list. Pass it in
+# with `docker run --env-file .env`, or rely on python-dotenv
+# (`load_dotenv()` in main_mcp.py / main_api.py), which reads the file from
+# the WORKDIR (/projects/generative_models/.env).
 ENV LD_LIBRARY_PATH="/opt/conda/envs/Mol_gen_env/lib:$LD_LIBRARY_PATH"
 ENV PYTHONPATH="/projects/generative_models:$PYTHONPATH"
 ENV PYTHONPATH="/projects/CoScientist/:$PYTHONPATH"

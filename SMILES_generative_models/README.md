@@ -54,18 +54,10 @@ not change.
 
 ### 3. Run
 
-Pick one of:
-
-**docker compose (recommended)** — picks up `.env` automatically:
+Pass `.env` explicitly and reserve a GPU:
 
 ```bash
-docker compose up -d --build
-```
-
-**docker run** — pass `.env` explicitly and reserve a GPU:
-
-```bash
-docker run --name gen_models_mcp_server --rm \
+docker run --name gen_models_mcp_server \
   --runtime=nvidia \
   -e NVIDIA_VISIBLE_DEVICES=<your_device_id> \
   -m 64G --cpus="6" \
@@ -132,11 +124,9 @@ Generic mode (`case` omitted) uses the bundled fallback GAN — no S3 lookup.
 After pulling new code, rebuild and restart:
 
 ```bash
-docker compose up -d --build
-# or, if running via `docker run`:
 docker build -t generative_model_mcp .
 docker rm -f gen_models_mcp_server 2>/dev/null
-docker run --name gen_models_mcp_server --rm \
+docker run --name gen_models_mcp_server \
   --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=<id> \
   -m 64G --cpus="6" --env-file .env \
   -p ${MOLS_GEN_MCP_PORT}:${MOLS_GEN_MCP_PORT} \
@@ -154,10 +144,6 @@ the container after editing `.env`.
   entrypoint silently breaks. The Dockerfile defensively runs
   `sed -i 's/\r$//' api.sh`, and `.gitattributes` pins shell scripts to LF;
   do not bypass these.
-- **`network_mode: host` on Windows**: works fine on Linux, has limitations
-  under Docker Desktop. The supplied `docker-compose.yml` uses host networking
-  by default; if `curl http://<host>:${MOLS_GEN_MCP_PORT}/mcp/` is refused
-  from outside the host machine, fall back to `docker run -p ...:...`.
 - **Port conflict**: do not set `GEN_MOLS_MODEL_APP_PORT == MOLS_GEN_MCP_PORT`.
 
 ## Local development (no Docker) — UV environments
