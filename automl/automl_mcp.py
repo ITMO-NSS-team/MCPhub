@@ -828,9 +828,14 @@ def predict_ml(
     Output:
         Predictions are saved to S3 as a CSV under
         `{output_s3_prefix}/{case}/{uuid}.csv` and a presigned URL is returned
-        in the response. The raw inline dict is omitted by default to keep
-        the agent response small; set `return_inline_predictions=True` to also
-        include the full predictions inline.
+        in the response. The CSV is self-contained: the first column is the
+        input SMILES (named per `smiles_column`, default `"Smiles"`), followed
+        by one column per predicted property — so the file can be re-fed
+        directly into another `predict_ml(input_data_url=..., smiles_column=...)`
+        call without losing molecule identity. The raw inline dict is omitted
+        by default to keep the agent response small; set
+        `return_inline_predictions=True` to also include the full predictions
+        inline.
 
     Args:
         case: Trained case name.
@@ -1045,7 +1050,20 @@ def predict_ml(
                     vals.extend([None] * (predicted_row_count - len(vals)))
                 elif len(vals) > predicted_row_count:
                     normalized_predictions[col] = vals[:predicted_row_count]
-        df = pd.DataFrame(normalized_predictions)
+
+        # Prepend the input SMILES column so the uploaded CSV is self-contained
+        # (each prediction row carries its source molecule). The column name
+        # matches the `smiles_column` argument so a downstream consumer can
+        # re-feed the file straight into `predict_ml(input_data_url=..., smiles_column=...)`.
+        smiles_col_name = smiles_column or "Smiles"
+        smiles_for_csv = list(resolved_smiles)
+        if predicted_row_count > 0:
+            if len(smiles_for_csv) < predicted_row_count:
+                smiles_for_csv = smiles_for_csv + [None] * (predicted_row_count - len(smiles_for_csv))
+            elif len(smiles_for_csv) > predicted_row_count:
+                smiles_for_csv = smiles_for_csv[:predicted_row_count]
+        ordered = {smiles_col_name: smiles_for_csv, **normalized_predictions}
+        df = pd.DataFrame(ordered)
         df.to_csv(local_output, index=False)
 
         upload_info = upload_predictions_csv_to_s3(

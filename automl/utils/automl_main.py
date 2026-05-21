@@ -329,12 +329,20 @@ def run_predict_automl_from_list(case:str,
         data_preapred = input_data_preparing_from_list(case=case, split=False,data=data,problem=problem)
         weights_path = _resolve_existing_path(state(case,'ml')['weights_path'][problem])
         pipeline = Pipeline().load(weights_path)
-        resutls = pipeline.predict(input_data=data_preapred)
+        # FEDOT default returns continuous values for both problems; for
+        # classification this is the per-class probability matrix
+        # (n_rows, n_classes). Passing `output_mode='labels'` makes the
+        # pipeline argmax to discrete class IDs (e.g. 0/1 for binary IC50),
+        # which is what downstream agents and CSV consumers expect.
+        output_mode = "labels" if problem == "classification" else "default"
+        resutls = pipeline.predict(input_data=data_preapred, output_mode=output_mode)
+        # With output_mode='labels' classifier returns ints; keep them ints.
+        caster = int if problem == "classification" else float
         for i,prop in enumerate(state(case,'ml')["Predictable properties"][problem]):
             if len(resutls.predict.shape)>1:
-                properties[prop] = list(map(float,resutls.predict[:,i]))
+                properties[prop] = list(map(caster, resutls.predict[:,i]))
             else:
-                properties[prop] = list(map(float,resutls.predict))
+                properties[prop] = list(map(caster, resutls.predict))
     return properties
 
 
