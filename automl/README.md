@@ -65,8 +65,17 @@ async def main():
 asyncio.run(main())
 ```
 
-Expected tools: `list_s3_train_cases`, `get_s3_train_case_columns`,
-`health_check`, `check_state`, `train_ml`, `train_ml_job_status`, `predict_ml`.
+Expected tools: `list_automl_train_cases`, `get_s3_train_case_columns`,
+`health_check`, `get_mcp_logs`, `check_state`, `train_ml`,
+`train_ml_job_status`, `predict_ml`.
+
+### Server-side logs
+
+Container entrypoint is `api.sh`, which starts the MCP via
+`nohup python automl_mcp.py > mcp.txt 2>&1`. The resulting log file lives
+at `/app/automl/mcp.txt` inside the container and is readable through the
+MCP itself via `get_mcp_logs(tail_lines=200)` — handy when a training run
+ends up in `status="Failed"` and you need the actual worker stack trace.
 
 ## MCP contract — data exchange via S3
 

@@ -14,6 +14,13 @@ from fastmcp import FastMCP
 load_dotenv()
 mcp = FastMCP(name="GenerativeModelsMCP")
 
+_PROJECT_DIR = Path(__file__).resolve().parent
+LOG_FILES: Dict[str, str] = {
+    "mcp": "mcp.txt",   # main_mcp.py stdout/stderr (api.sh: nohup ... > mcp.txt 2>&1 &)
+    "api": "api.txt",   # main_api.py stdout/stderr (api.sh: nohup ... > api.txt)
+}
+LOG_TAIL_HARD_CAP = 50_000
+
 
 def _normalize_base_url(base: str) -> str:
     base = base.strip().rstrip("/")
@@ -483,6 +490,84 @@ def get_state_from_server(url: str = "gen", case: Optional[str] = None) -> Union
         return state.get(case, f"Case: {case} not found")
     return state
 
+
+@mcp.tool()
+def get_mcp_logs(tail_lines: int = 200, source: str = "api") -> Dict[str, Any]:
+    """Read the server-side log file (stdout/stderr) of the generative stack.
+
+    The container entrypoint `api.sh` writes two log files:
+        - `mcp.txt`  — main_mcp.py (this MCP server)
+        - `api.txt`  — main_api.py (FastAPI backend that does the heavy
+                       lifting: GAN training, CVAE generation, novelty checks)
+
+    Most stack traces from `start_generative_model_training` /
+    `generate_*` failures land in `api.txt` because the actual model code
+    runs in the FastAPI process. Default is therefore `source="api"`. Use
+    `source="mcp"` for the thin MCP layer's own log.
+
+    Args:
+        tail_lines: How many trailing lines to return. Default `200`.
+            Capped at `50_000`. Values <= 0 are clamped to 1.
+        source: Which log to read — `"api"` (default) or `"mcp"`.
+
+    Returns:
+        Dict with:
+            - `status`: `ok` / `log_not_found` / `read_failed` / `bad_source`.
+            - `source`, `path`: which file was inspected.
+            - On `ok`:
+                - `total_lines`: total line count of the file.
+                - `returned_lines`: lines actually in `content`
+                  (<= requested `tail_lines`).
+                - `truncated`: `True` if `returned_lines < total_lines`.
+                - `content`: trailing slice of the log as one string.
+            - On failure: `message` field with detail.
+    """
+    src = (source or "").strip().lower()
+    if src not in LOG_FILES:
+        return {
+            "status": "bad_source",
+            "source": source,
+            "message": f"Unknown source {source!r}. Use one of: {sorted(LOG_FILES)}.",
+        }
+
+    log_path = _PROJECT_DIR / LOG_FILES[src]
+    if not log_path.is_file():
+        return {
+            "status": "log_not_found",
+            "source": src,
+            "path": str(log_path),
+            "message": (
+                f"Log file {log_path} not present. The container may have been "
+                "started without the api.sh entrypoint (which redirects "
+                "stdout/stderr of main_mcp.py / main_api.py to mcp.txt / api.txt)."
+            ),
+        }
+
+    n = max(1, min(int(tail_lines), LOG_TAIL_HARD_CAP))
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except Exception as exc:
+        return {
+            "status": "read_failed",
+            "source": src,
+            "path": str(log_path),
+            "message": f"{type(exc).__name__}: {exc}",
+        }
+
+    total = len(lines)
+    if total > n:
+        lines = lines[-n:]
+    return {
+        "status": "ok",
+        "source": src,
+        "path": str(log_path),
+        "total_lines": total,
+        "returned_lines": len(lines),
+        "truncated": total > len(lines),
+        "content": "".join(lines),
+    }
 
 
 @mcp.tool()

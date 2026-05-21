@@ -78,8 +78,17 @@ that port.
 python test_mcp_client.py --url http://<host>:${MOLS_GEN_MCP_PORT}/mcp/ --list-only
 ```
 
-Expected tools: `list_s3_train_cases`, `get_state_from_server`,
-`start_generative_model_training`, `generate_mols`, `generate_case_mols`.
+Expected tools: `list_generative_train_cases`, `get_state_from_server`,
+`get_mcp_logs`, `start_generative_model_training`, `generate_mols`,
+`generate_case_mols`.
+
+### Server-side logs
+
+Container entrypoint `api.sh` writes two log files inside the project root:
+`mcp.txt` (this MCP layer) and `api.txt` (the FastAPI backend that runs
+training / generation). Both are readable through the MCP itself via
+`get_mcp_logs(tail_lines=200, source="api"|"mcp")`. Default `source="api"`
+because the heavy work (and most stack traces) live there.
 
 ## MCP contract — data exchange via S3
 

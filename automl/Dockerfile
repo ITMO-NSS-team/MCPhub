@@ -29,4 +29,11 @@ COPY . ./
 # python-dotenv (`load_dotenv()` in automl_mcp.py / s3_utils.py), which reads
 # the file from the WORKDIR (/app/automl/.env).
 
-ENTRYPOINT ["python", "automl_mcp.py"]
+# Belt-and-suspenders against Windows CRLF: if the repo was checked out with
+# core.autocrlf=true, api.sh would have \r\n line endings and bash would
+# silently break (cd target, etc.). Strip them.
+RUN sed -i 's/\r$//' /app/automl/api.sh && chmod +x /app/automl/api.sh
+
+# Output of the MCP server is captured to /app/automl/mcp.txt by api.sh and
+# can be read back through the `get_mcp_logs` MCP tool.
+ENTRYPOINT ["/bin/bash", "/app/automl/api.sh"]

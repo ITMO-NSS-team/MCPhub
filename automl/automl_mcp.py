@@ -35,6 +35,8 @@ load_dotenv()
 
 IMPORT_PATH = Path(__file__).resolve().parent
 STATE_FILE = "state.json"
+LOG_FILE = "mcp.txt"           # written by api.sh (nohup python ... > mcp.txt 2>&1)
+LOG_TAIL_HARD_CAP = 50_000     # safety ceiling for `get_mcp_logs(tail_lines=...)`
 
 mcp = FastMCP("automl-mcp")
 _TRAIN_JOBS: Dict[str, Process] = {}
@@ -56,6 +58,30 @@ def _normalize_s3_uri_to_key(s3_uri_or_key: Optional[str]) -> Optional[str]:
         normalized = raw
     normalized = normalized.replace("\\", "/").lstrip("/")
     return normalized or None
+
+
+def _format_exit_error(exitcode: Optional[int]) -> str:
+    """Build a factual error string for a non-zero worker exitcode.
+
+    Reports only what the OS tells us — exitcode and (on POSIX, when the
+    process was killed by a signal) the signal name. No speculation about
+    root cause; the agent / operator should consult the container logs for
+    the actual stack trace.
+    """
+    if exitcode is None:
+        return "process died with unknown exitcode"
+    if exitcode >= 0:
+        return f"process exited with non-zero code {exitcode}; check container logs"
+    signal_num = -exitcode
+    try:
+        import signal as _signal
+        signal_name = _signal.Signals(signal_num).name
+    except (ValueError, AttributeError):
+        signal_name = f"signal {signal_num}"
+    return (
+        f"process killed (exitcode={exitcode}, signal={signal_name}); "
+        "check container logs for the underlying error"
+    )
 
 
 def _download_csv_via_http(url: str, local_csv_path: str) -> str:
@@ -441,6 +467,70 @@ def health_check() -> dict[str, str]:
 
 
 @mcp.tool()
+def get_mcp_logs(tail_lines: int = 200) -> dict[str, Any]:
+    """Read the MCP server's own stdout/stderr log file (`mcp.txt`).
+
+    The log is produced by the container entrypoint `api.sh`
+    (`nohup python automl_mcp.py > mcp.txt 2>&1`). Useful for debugging a
+    failed training (e.g. when `check_state` reports
+    `status="Failed", error="process killed (signal=SIGSEGV)..."` and the
+    agent needs the actual stack trace from the worker).
+
+    Args:
+        tail_lines: How many trailing lines of the log to return. Default
+            `200`. Pass a larger value (capped at `50_000`) to fetch more.
+            Values <= 0 are clamped to 1.
+
+    Returns:
+        Dict with:
+            - `status`: `ok` / `log_not_found` / `read_failed`.
+            - `path`: absolute path of the log file on the container disk.
+            - On `ok`:
+                - `total_lines`: total line count of the file.
+                - `returned_lines`: how many lines are in `content`
+                  (<= requested `tail_lines`).
+                - `truncated`: `True` if `returned_lines < total_lines`.
+                - `content`: the trailing slice of the log as one string.
+            - On `log_not_found` / `read_failed`: `message` field with detail.
+    """
+    log_path = IMPORT_PATH / LOG_FILE
+    if not log_path.is_file():
+        return {
+            "status": "log_not_found",
+            "path": str(log_path),
+            "message": (
+                f"Log file {log_path} not present. The MCP may have been "
+                "started without the api.sh entrypoint (which redirects "
+                "stdout/stderr to mcp.txt)."
+            ),
+        }
+
+    n = max(1, min(int(tail_lines), LOG_TAIL_HARD_CAP))
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except Exception as exc:
+        return {
+            "status": "read_failed",
+            "path": str(log_path),
+            "message": f"{type(exc).__name__}: {exc}",
+        }
+
+    total = len(lines)
+    if total > n:
+        lines = lines[-n:]
+    return {
+        "status": "ok",
+        "path": str(log_path),
+        "total_lines": total,
+        "returned_lines": len(lines),
+        "truncated": total > len(lines),
+        "content": "".join(lines),
+    }
+
+
+@mcp.tool()
 def check_state() -> dict[str, Any]:
     """Get current training registry and available calculable properties.
 
@@ -675,11 +765,7 @@ def train_ml_job_status(job_id: str) -> dict[str, Any]:
                     state.ml_model_upd_status(
                         case=case,
                         status=3,
-                        error=(
-                            f"process killed (exitcode={exitcode}). "
-                            "Likely OOM or external SIGKILL — try reducing "
-                            "TRAIN_DATA_LIMIT or freeing memory on the host."
-                        ),
+                        error=_format_exit_error(exitcode),
                     )
                     reconciled = True
         except Exception as exc:
