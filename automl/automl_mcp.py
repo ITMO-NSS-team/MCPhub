@@ -575,6 +575,7 @@ def train_ml(
     regression_props: Optional[List[str]] = None,
     classification_props: Optional[List[str]] = None,
     save_trained_data_to_sync_server: bool = True,
+    timeout: int = 30,
 ) -> dict[str, Any]:
     """Train AutoML pipelines for molecule property prediction by specific case.
 
@@ -642,6 +643,14 @@ def train_ml(
             artifacts are uploaded to S3 under
             `ml_weights/{case}/trained_data_{case}_{problem}/...` after
             training finishes.
+        timeout: Per-problem search budget in MINUTES passed to FEDOT.
+            Default `30`. Bigger value gives FEDOT more time to evolve the
+            pipeline (and is more likely to trigger the `best_quality`
+            preset with heavier candidates like catboost/xgboost/lgbm/mlp);
+            smaller value forces the lightweight `fast_train` preset and
+            finishes faster but with less search. For two-problem cases
+            (regression + classification) the wall-clock total is roughly
+            2 × timeout plus overhead. Minimum 1 minute.
 
     Returns:
         Dictionary with async start metadata:
@@ -672,6 +681,7 @@ def train_ml(
         "description": description,
         "save_trained_data_to_sync_server": bool(save_trained_data_to_sync_server),
         "data_url": resolved_url,
+        "timeout": max(1, int(timeout)),
     }
     if target_column is not None:
         payload_data_raw["target_column"] = target_column
