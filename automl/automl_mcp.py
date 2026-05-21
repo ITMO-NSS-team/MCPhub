@@ -2,10 +2,11 @@ import os
 from datetime import datetime, timezone
 from multiprocessing import Process
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 from fastmcp import FastMCP
@@ -57,21 +58,135 @@ def _normalize_s3_uri_to_key(s3_uri_or_key: Optional[str]) -> Optional[str]:
     return normalized or None
 
 
-def _read_smiles_from_local_csv(local_csv_path: str, smiles_column: str) -> List[str]:
-    """Read SMILES strings from a column in a downloaded CSV file."""
+def _download_csv_via_http(url: str, local_csv_path: str) -> str:
+    """Stream a CSV from an HTTP(S) URL (e.g. an S3 presigned URL) to disk.
+
+    No S3 credentials are required — the URL is fetched via plain
+    `requests.get(...)`, so it may point at any reachable endpoint / account.
+    """
+    timeout_s = int(os.getenv("PREDICT_INPUT_HTTP_TIMEOUT_S", "1800"))
+    local_dir = os.path.dirname(local_csv_path)
+    if local_dir:
+        os.makedirs(local_dir, exist_ok=True)
+    with requests.get(url, stream=True, timeout=timeout_s) as resp:
+        resp.raise_for_status()
+        with open(local_csv_path, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    fh.write(chunk)
+    return local_csv_path
+
+
+_COMMON_SMILES_COLUMN_ALIASES: Tuple[str, ...] = (
+    "Smiles",
+    "smiles",
+    "SMILES",
+    "canonical_smiles",
+    "canonicalSmiles",
+    "Canonical_Smiles",
+    "Molecules",
+    "Molecule",
+    "molecule",
+    "mol",
+    "smiles_string",
+    "SMILES_string",
+)
+
+_SMILES_VALID_CHARS = set("CNOPSFIBrClHcnopsfibrclh0123456789=#-+/\\.()[]@%")
+
+
+def _looks_like_smiles(value: Any) -> bool:
+    """Heuristic check that a single value is plausibly a SMILES string.
+
+    Cheap (no RDKit dependency): the value must be a string of length >= 2,
+    contain no whitespace, include at least one atom letter, and have most
+    of its characters drawn from the SMILES alphabet.
+    """
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    if len(v) < 2 or any(ch.isspace() for ch in v):
+        return False
+    if not any(ch in "CNOPSFIcnopsfi" for ch in v):
+        return False
+    valid_ratio = sum(ch in _SMILES_VALID_CHARS for ch in v) / len(v)
+    return valid_ratio > 0.9
+
+
+def _resolve_smiles_column(
+    df: pd.DataFrame,
+    requested: Optional[str],
+) -> Tuple[str, str]:
+    """Find the SMILES column in ``df``.
+
+    Resolution order:
+        1. Exact match on ``requested``.
+        2. Case-insensitive match on ``requested``.
+        3. First match (case-insensitive) against ``_COMMON_SMILES_COLUMN_ALIASES``.
+        4. Heuristic: the column whose top-5 non-null values look most like
+           SMILES strings (per ``_looks_like_smiles``).
+
+    Returns:
+        Tuple ``(column_name, resolution_mode)`` where ``resolution_mode`` is
+        one of ``"exact" | "case_insensitive" | "alias" | "auto"``.
+
+    Raises:
+        ValueError if no plausible column is found.
+    """
+    columns = list(df.columns)
+    lc_columns = {str(c).lower(): c for c in columns}
+
+    if requested:
+        if requested in columns:
+            return requested, "exact"
+        lc = requested.lower()
+        if lc in lc_columns:
+            return lc_columns[lc], "case_insensitive"
+
+    for alias in _COMMON_SMILES_COLUMN_ALIASES:
+        if alias.lower() in lc_columns:
+            return lc_columns[alias.lower()], "alias"
+
+    sample_size = 5
+    best_col: Optional[str] = None
+    best_hits = 0
+    for col in columns:
+        series = df[col].dropna().astype(str).head(sample_size)
+        if series.empty:
+            continue
+        hits = sum(_looks_like_smiles(v) for v in series)
+        if hits > best_hits:
+            best_hits = hits
+            best_col = col
+
+    if best_col is not None and best_hits >= 2:
+        return best_col, "auto"
+
+    raise ValueError(
+        f"Could not find a SMILES column in CSV. Requested: {requested!r}. "
+        f"Tried common aliases and content heuristic. Available columns: {columns}."
+    )
+
+
+def _read_smiles_from_local_csv(
+    local_csv_path: str,
+    smiles_column: Optional[str],
+) -> Tuple[List[str], str, str]:
+    """Read SMILES strings from a downloaded CSV file with column auto-detection.
+
+    Returns:
+        ``(smiles_list, resolved_column, resolution_mode)`` — see
+        ``_resolve_smiles_column`` for the meaning of ``resolution_mode``.
+    """
     try:
         df = pd.read_csv(local_csv_path)
     except Exception:
         # Fallback for uncommon delimiters.
         df = pd.read_csv(local_csv_path, sep=None, engine="python")
-    if smiles_column not in df.columns:
-        raise ValueError(
-            f"Column '{smiles_column}' not found in CSV. "
-            f"Available columns: {df.columns.tolist()}"
-        )
-    series = df[smiles_column].dropna().astype(str).str.strip()
+    resolved_column, resolution_mode = _resolve_smiles_column(df, smiles_column)
+    series = df[resolved_column].dropna().astype(str).str.strip()
     series = series[series != ""]
-    return series.tolist()
+    return series.tolist(), resolved_column, resolution_mode
 
 
 def _normalize_s3_prefix(prefix: str) -> str:
@@ -512,6 +627,7 @@ def predict_ml(
     case: str,
     smiles_list: Optional[List[str]] = None,
     input_s3_key: Optional[str] = None,
+    input_data_url: Optional[str] = None,
     smiles_column: str = "Smiles",
     upload_predictions_to_s3: bool = True,
     output_s3_prefix: str = "predictions",
@@ -520,9 +636,24 @@ def predict_ml(
 ) -> Dict[str, Any]:
     """Run AutoML model inference for a given case to predict molecular properties.
 
-    Input options (provide exactly one):
-        - `smiles_list`: list of SMILES molecules.
-        
+    Input options (provide EXACTLY ONE):
+        - `smiles_list`: inline list of SMILES strings — best for ad-hoc /
+          short batches sent directly by the agent.
+        - `input_s3_key`: S3 object key (or `s3://bucket/key` URI) inside the
+          AutoML server's configured bucket. The MCP server downloads it via
+          its own boto3 client (S3 credentials from `.env`). Use when the
+          CSV already lives in the agreed-upon bucket.
+        - `input_data_url`: HTTP(S) URL of a CSV — typically an S3 presigned
+          URL, but any reachable public URL works. The MCP server fetches it
+          via plain `requests.get(...)`, so NO S3 credentials are required
+          and the URL may point at a different bucket / account / S3-compatible
+          backend than the AutoML server itself uses. Symmetric with
+          `train_ml.train_data_url`. Ideal for chaining generators →
+          predictors when the producer hands back a presigned URL.
+
+    For all CSV-based inputs the SMILES column name is taken from
+    `smiles_column` (default `"Smiles"`); the column is converted to a
+    `smiles_list` internally and the rest of the pipeline is identical.
 
     Output:
         Predictions are saved to S3 as a CSV under
@@ -533,9 +664,21 @@ def predict_ml(
 
     Args:
         case: Trained case name.
-        smiles_list: Optional inline SMILES list.
-        smiles_column: Column name with SMILES when reading `input_s3_key`.
-            Default `"Smiles"`.
+        smiles_list: Optional inline SMILES list. See "Input options" above.
+        input_s3_key: Optional S3 key/URI to a CSV with a SMILES column.
+            See "Input options" above.
+        input_data_url: Optional HTTP(S) URL of a CSV (e.g. presigned URL).
+            See "Input options" above.
+        smiles_column: Hint for the SMILES column when reading
+            `input_s3_key` or `input_data_url`. Default `"Smiles"`. The
+            resolver tries, in order: exact match, case-insensitive match,
+            a list of common aliases (`canonical_smiles`, `SMILES`,
+            `Molecules`, `mol`, ...), and finally a content-based heuristic
+            that picks the column whose top values look most like SMILES
+            (so the tool still works if the column name is arbitrary, e.g.
+            `compound_smiles`). The actually used column is surfaced as
+            `smiles_column_used` / `smiles_column_resolution` in the
+            success response.
         upload_predictions_to_s3: When True (default), upload the predictions
             CSV to S3 and return a presigned URL. When False, only inline
             predictions are returned (`return_inline_predictions` is forced
@@ -569,6 +712,11 @@ def predict_ml(
                 - `property_columns`: predicted property column names.
                 - `weights_downloaded_from_s3`: list of problems whose weights
                   were freshly fetched from S3 during this call.
+                - `smiles_column_used` / `smiles_column_resolution`: the
+                  CSV column the SMILES were actually read from and how it
+                  was resolved (`"exact" | "case_insensitive" | "alias" |
+                  "auto"`). Only present for CSV inputs (`input_s3_key` /
+                  `input_data_url`).
                 - `predictions_s3_key`, `predictions_presigned_url`,
                   `expires_in`, `bucket_name`: present when
                   `upload_predictions_to_s3=True`.
@@ -578,17 +726,39 @@ def predict_ml(
               `problems_downloaded`, `problems_checked`, `weights_details`.
 
     Raises:
-        ValueError: if neither or both input forms are given, or if the SMILES
-            column is missing in the input CSV.
+        ValueError: if zero or more than one of `smiles_list` /
+            `input_s3_key` / `input_data_url` is supplied, if
+            `input_data_url` is not an HTTP(S) URL, or if no SMILES column
+            can be located in the input CSV (neither the requested name,
+            common aliases, nor the content heuristic match anything).
     """
-    if (smiles_list is None or len(smiles_list) == 0) and not input_s3_key:
-        raise ValueError("Provide either `smiles_list` or `input_s3_key`.")
-    if smiles_list and input_s3_key:
-        raise ValueError("Provide only one of `smiles_list` or `input_s3_key`.")
+    has_list = bool(smiles_list)
+    has_key = bool(input_s3_key)
+    resolved_url = (input_data_url or "").strip()
+    has_url = bool(resolved_url)
+    provided = sum([has_list, has_key, has_url])
+    if provided == 0:
+        raise ValueError(
+            "Provide exactly one of `smiles_list`, `input_s3_key`, or `input_data_url`."
+        )
+    if provided > 1:
+        raise ValueError(
+            "Provide ONLY one of `smiles_list`, `input_s3_key`, or `input_data_url`."
+        )
+    if has_url:
+        lowered = resolved_url.lower()
+        if not (lowered.startswith("http://") or lowered.startswith("https://")):
+            raise ValueError(
+                "`input_data_url` must be an HTTP(S) URL (e.g. an S3 presigned URL); "
+                f"got: {input_data_url!r}"
+            )
 
     payload = MLData(case=case, timeout=timeout)
 
-    if input_s3_key:
+    smiles_column_used: Optional[str] = None
+    smiles_column_resolution: Optional[str] = None
+
+    if has_key:
         normalized_in_key = _normalize_s3_uri_to_key(input_s3_key)
         if not normalized_in_key:
             raise ValueError(f"`input_s3_key` is invalid: {input_s3_key!r}")
@@ -600,9 +770,22 @@ def predict_ml(
             s3_key_or_uri=normalized_in_key,
             local_csv_path=str(local_input),
         )
-        resolved_smiles = _read_smiles_from_local_csv(
-            local_csv_path=str(local_input),
-            smiles_column=smiles_column,
+        resolved_smiles, smiles_column_used, smiles_column_resolution = (
+            _read_smiles_from_local_csv(
+                local_csv_path=str(local_input),
+                smiles_column=smiles_column,
+            )
+        )
+    elif has_url:
+        download_dir = IMPORT_PATH / "data" / "s3_inputs"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        local_input = download_dir / f"{uuid4().hex}.csv"
+        _download_csv_via_http(url=resolved_url, local_csv_path=str(local_input))
+        resolved_smiles, smiles_column_used, smiles_column_resolution = (
+            _read_smiles_from_local_csv(
+                local_csv_path=str(local_input),
+                smiles_column=smiles_column,
+            )
         )
     else:
         resolved_smiles = [str(s).strip() for s in (smiles_list or []) if str(s).strip()]
@@ -667,6 +850,9 @@ def predict_ml(
         "property_columns": property_columns,
         "weights_downloaded_from_s3": weights_status.get("problems_downloaded", []),
     }
+    if smiles_column_used is not None:
+        result["smiles_column_used"] = smiles_column_used
+        result["smiles_column_resolution"] = smiles_column_resolution
 
     effective_inline = return_inline_predictions or not upload_predictions_to_s3
     if effective_inline:
