@@ -539,13 +539,19 @@ def case_trainer(data:TrainData=Body()):
         
         if state(data.case,'ml') is None:
             print(f"{data.case} is not exist! Train ML model before")
-            state.gen_model_upd_status(case=data.case,status=3)
+            state.gen_model_upd_status(
+                case=data.case,
+                error=(
+                    f"Precondition failed: case '{data.case}' has no ML model "
+                    f"registered. Train an AutoML pipeline first (`train_ml`)."
+                ),
+            )
             return 0
 
         use_cond2dec = False
         main(epochs=data.epochs,
             conditions = state(data.case,'ml')['target_column'],
-            case=data.case, 
+            case=data.case,
             server_dir = f'autotrain/train_{data.case}',
             data_path_with_conds = data.data_path,
             test_mode=test_mode,
@@ -559,7 +565,7 @@ def case_trainer(data:TrainData=Body()):
             ml_model_url=os.getenv('ML_MOLS_MODEL_APP_URL'))
     except Exception as e:
         print(e)
-        state.gen_model_upd_status(case=data.case,error=str(e))
+        state.gen_model_upd_status(case=data.case,error=f"{type(e).__name__}: {e}")
 
 def gan_case_trainer(data:TrainData=Body()):
     # #####FOR TEST####
@@ -610,7 +616,13 @@ def gan_case_trainer(data:TrainData=Body()):
         
         if state(data.case,'ml') is None:
             print(f"{data.case} is not exist! Train ML model before")
-            state.gen_model_upd_status(case=data.case,status=3)
+            state.gen_model_upd_status(
+                case=data.case,
+                error=(
+                    f"Precondition failed: case '{data.case}' has no ML model "
+                    f"registered. Train an AutoML pipeline first (`train_ml`)."
+                ),
+            )
             return 0
 
         auto_train(data.case,
@@ -622,7 +634,7 @@ def gan_case_trainer(data:TrainData=Body()):
 
     except Exception as e:
         print(e)
-        state.gen_model_upd_status(case=data.case,error=str(e))
+        state.gen_model_upd_status(case=data.case,error=f"{type(e).__name__}: {e}")
 
 def gan_case_trainer_s3(data:TrainDataS3=Body()):
     # #####FOR TEST####
@@ -766,7 +778,7 @@ def gan_case_trainer_s3(data:TrainDataS3=Body()):
     except Exception as e:
         print(e)
         if getattr(data, "case", None) and state(data.case) is not None:
-            state.gen_model_upd_status(case=data.case,error=str(e))
+            state.gen_model_upd_status(case=data.case,error=f"{type(e).__name__}: {e}")
 
 def gan_auto_generator(data:GenData=Body()):
     state = TrainState(state_path='autotrain/utils/state.json')

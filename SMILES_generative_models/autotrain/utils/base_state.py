@@ -1,20 +1,24 @@
 import json
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Optional
 from pydantic import BaseModel
 import os
 from autotrain.utils.calculateble_prop_funcs import config
 from autotrain.utils.state_s3 import download_state_file, upload_state_file
 
 
+VALID_STATUSES = ("Not Trained", "Training", "Trained", "Failed")
+
+
 class BaseState(BaseModel):
     status:str = None
-    weights_path:str = {"regression" : None, "classification" : None} 
+    weights_path:str = {"regression" : None, "classification" : None}
     arch_type:str = None
     case_name: str = None
     base_state:dict = {"description" : None,
-                       "generative_models": {"data_path":None,"feature_column":None,"target_column":None,"problem":None,'status':status,'weights_path':None,'arch_type':arch_type,"metric":None},
+                       "generative_models": {"data_path":None,"feature_column":None,"target_column":None,"problem":None,'status':status,'weights_path':None,'arch_type':arch_type,"metric":None,"error":None,"error_at":None},
                         "ml_models":{"data_path":None,"feature_column":None,"target_column":None,'status':status,'weights_path' : weights_path,"metric":None,
-                            "Predictable properties" : {}
+                            "Predictable properties" : {}, "error": None, "error_at": None
                                   }
                         }
 class TrainState:
@@ -28,10 +32,14 @@ class TrainState:
     """
     defult_parameters = BaseState()
 
-    def __init__(self, state_path: str = None, sync_with_s3: bool = True, state_s3_key: str = None):
+    def __init__(self, state_path: str = None, sync_with_s3: bool = True):
+        # The S3 key for state.json is a hardcoded contract shared with the
+        # AutoML MCP server (see autotrain/utils/state_s3.STATE_S3_KEY). It
+        # is NOT configurable per-instance / per-env: any drift between the
+        # two servers' keys would split the state into two independent
+        # files, silently dropping cases registered on the "other" server.
         self.state_path = state_path
         self.sync_with_s3 = sync_with_s3
-        self.state_s3_key = state_s3_key or os.getenv("STATE_S3_KEY") or "state/state.json"
 
         if self.state_path is None:
             self.state_path = r'autotrain/utils/state.json'
@@ -162,29 +170,46 @@ class TrainState:
                             model_weight_path:str = None,
                             metric = None,
                             status:int = None,
-                            problem:str = 'regression'):
-        """Updates the training status of the machine learning model on each call.
-          Additionally, you can specify the path to the folder where the model weights are saved after training.
-        Also, you can specify the metric value after training.
+                            problem:str = 'regression',
+                            error: Optional[str] = None):
+        """Update ML training status, weights path, metrics, or error.
 
         Args:
-            case (str): Case name.
-            model_weight_path (str, optional): Path to trained model weights save folder. Defaults to None.
-            metric (_type_, optional): Value of metric after model training. Defaults to None.
-            status (int, optional): ID value of status. Where 0 - "Not Trained", 1 - Training, 2 - "Trained". Defaults to None.
+            case: Case name.
+            model_weight_path: Path to trained model weights save folder.
+            metric: Value of metric after model training.
+            status: 0=Not Trained, 1=Training, 2=Trained, 3=Failed.
+            problem: 'regression' or 'classification'.
+            error: Optional human-readable error message. When provided,
+                writes `error` + `error_at` and forces `status="Failed"` if
+                no explicit `status` was supplied. On a successful Trained
+                transition, error fields are cleared.
         """
-        valid_status = ['Not Trained','Training','Trained']
+        entry = self.current_state[case]["ml_models"]
+        entry.setdefault("error", None)
+        entry.setdefault("error_at", None)
+
+        if error is not None:
+            entry["error"] = str(error)
+            entry["error_at"] = datetime.now(timezone.utc).isoformat()
+            if status is None:
+                entry["status"] = "Failed"
+
         if status is not None:
-            self.current_state[case]["ml_models"]['status'] = valid_status[status]
-        elif self.current_state[case]["ml_models"]['status'] == 'Trained':
+            entry["status"] = VALID_STATUSES[status]
+            if VALID_STATUSES[status] == "Trained":
+                entry["error"] = None
+                entry["error_at"] = None
+        elif entry["status"] == "Trained":
             print(f'ML model for task "{case}" already trained!')
+
         if model_weight_path is not None:
-            if not os.path.isdir(model_weight_path ):
-                    os.mkdir(model_weight_path )
-        if self.current_state[case]["ml_models"]['weights_path'][problem] is None and model_weight_path is not None:
-            self.current_state[case]["ml_models"]['weights_path'][problem] = model_weight_path 
-        if not metric is None:
-           self.current_state[case]["ml_models"]['metric'] =  metric
+            if not os.path.isdir(model_weight_path):
+                os.mkdir(model_weight_path)
+        if entry["weights_path"][problem] is None and model_weight_path is not None:
+            entry["weights_path"][problem] = model_weight_path
+        if metric is not None:
+            entry["metric"] = metric
         self.__save_state()
 
     def gen_model_upd_status(self,
@@ -192,29 +217,51 @@ class TrainState:
                              model_weight_path:str = None,
                              metric = None,
                              status:int = None,
-                             error = None):
-        """Updates the training status of the generative model on each call.
-          Additionally, you can specify the path to the folder where the model weights are saved after training.
-        Also, you can specify the metric value after training.
+                             error: Optional[str] = None):
+        """Update generative training status, weights path, metrics, or error.
 
         Args:
-            case (str): Case name.
-            model_weight_path (str, optional): Path to trained model weights save folder. Defaults to None.
-            metric (_type_, optional): Value of metric after model training. Defaults to None.
+            case: Case name.
+            model_weight_path: Path to trained GAN weights folder.
+            metric: Value of metric after training.
+            status: 0=Not Trained, 1=Training, 2=Trained, 3=Failed.
+            error: Optional human-readable error message. When provided,
+                writes `error` + `error_at` and forces `status="Failed"`.
+                Status is kept clean as an enum; `error` lives next to it
+                instead of overwriting it (legacy behavior).
         """
+        entry = self.current_state[case]["generative_models"]
+        entry.setdefault("error", None)
+        entry.setdefault("error_at", None)
 
-        valid_status = ['Not Trained','Training','Trained','Error! Ml models have been not prepared!']
-        if status is not None:
-            self.current_state[case]["generative_models"]['status'] = valid_status[status]
         if error is not None:
-            self.current_state[case]["generative_models"]['status'] = error
+            entry["error"] = str(error)
+            entry["error_at"] = datetime.now(timezone.utc).isoformat()
+            entry["status"] = "Failed"
+        elif status is not None:
+            entry["status"] = VALID_STATUSES[status]
+            if VALID_STATUSES[status] == "Trained":
+                entry["error"] = None
+                entry["error_at"] = None
+        else:
+            # Legacy auto-progression for callers that pass neither status nor error
+            # (auto_train.py / auto_generate.py rely on this).
+            if entry["status"] is None:
+                entry["status"] = "Training"
+            elif entry["status"] == "Training":
+                entry["status"] = "Trained"
+                entry["error"] = None
+                entry["error_at"] = None
+            else:
+                print(f'Generative model for task "{case}" already trained!')
+
         if model_weight_path is not None:
             if not os.path.isdir(model_weight_path):
                 os.mkdir(model_weight_path)
-        if  model_weight_path is not None: #not self.current_state[case]["generative_models"]['weights_path'] is None and
-            self.current_state[case]["generative_models"]['weights_path'] = model_weight_path
-        if not metric is None:
-           self.current_state[case]["generative_models"]['metric'] =  metric
+        if model_weight_path is not None:
+            entry["weights_path"] = model_weight_path
+        if metric is not None:
+            entry["metric"] = metric
         self.__save_state()
     
     def show_calculateble_propreties(self):
@@ -235,7 +282,7 @@ class TrainState:
         if not self.sync_with_s3:
             return False
         try:
-            download_state_file(local_path=self.state_path, state_s3_key=self.state_s3_key)
+            download_state_file(local_path=self.state_path)
             return True
         except Exception as exc:
             if raise_on_error:
@@ -247,7 +294,7 @@ class TrainState:
         if not self.sync_with_s3:
             return False
         try:
-            upload_state_file(local_path=self.state_path, state_s3_key=self.state_s3_key)
+            upload_state_file(local_path=self.state_path)
             return True
         except Exception as exc:
             if raise_on_error:

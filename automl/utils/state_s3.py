@@ -1,13 +1,15 @@
 import os
 from pathlib import Path
-from typing import List
 
 try:
     from s3_utils import S3BucketService, s3_service as default_s3_service
 except ModuleNotFoundError:
     from ..s3_utils import S3BucketService, s3_service as default_s3_service
 
-DEFAULT_STATE_S3_KEYS = ("state/state.json", "state.json")
+# Hardcoded contract: SHARED between automl-mcp and GenerativeModelsMCP.
+# Both servers read/write the same key so state.json is one source of truth.
+# Do NOT make this configurable — see comment in base_state.py.
+STATE_S3_KEY = "state/state.json"
 
 
 def build_s3_service(
@@ -38,24 +40,6 @@ def build_s3_service(
     )
 
 
-def resolve_state_s3_keys(state_s3_key: str = None) -> List[str]:
-    keys = []
-    if state_s3_key:
-        keys.append(state_s3_key)
-    else:
-        env_key = os.getenv("STATE_S3_KEY")
-        if env_key:
-            keys.append(env_key)
-    keys.extend(DEFAULT_STATE_S3_KEYS)
-
-    resolved = []
-    for key in keys:
-        normalized = key.replace("\\", "/").strip("/")
-        if normalized and normalized not in resolved:
-            resolved.append(normalized)
-    return resolved
-
-
 def _split_s3_key(s3_key: str):
     normalized = s3_key.replace("\\", "/").strip("/")
     if not normalized:
@@ -68,30 +52,17 @@ def _split_s3_key(s3_key: str):
 
 def download_state_file(
     local_path: str,
-    state_s3_key: str = None,
     s3_bucket_service: S3BucketService = None,
 ) -> str:
     local_state_path = Path(local_path)
     local_state_path.parent.mkdir(parents=True, exist_ok=True)
     service = s3_bucket_service or build_s3_service()
-
-    errors = []
-    for s3_key in resolve_state_s3_keys(state_s3_key):
-        try:
-            service.download_image_from_s3(s3_key=s3_key, local_path=str(local_state_path))
-            return s3_key
-        except Exception as exc:
-            errors.append(f"{s3_key}: {exc}")
-
-    raise RuntimeError(
-        f"Failed to download state file from S3. Tried keys: {resolve_state_s3_keys(state_s3_key)}. "
-        f"Errors: {'; '.join(errors)}"
-    )
+    service.download_image_from_s3(s3_key=STATE_S3_KEY, local_path=str(local_state_path))
+    return STATE_S3_KEY
 
 
 def upload_state_file(
     local_path: str,
-    state_s3_key: str = None,
     s3_bucket_service: S3BucketService = None,
 ) -> str:
     local_state_path = Path(local_path)
@@ -99,11 +70,10 @@ def upload_state_file(
         raise FileNotFoundError(f"State file not found: {local_state_path}")
 
     service = s3_bucket_service or build_s3_service()
-    s3_key = resolve_state_s3_keys(state_s3_key)[0]
-    prefix, source_file_name = _split_s3_key(s3_key)
+    prefix, source_file_name = _split_s3_key(STATE_S3_KEY)
     service.upload_file_object(
         prefix=prefix,
         source_file_name=source_file_name,
         file_path=str(local_state_path),
     )
-    return s3_key
+    return STATE_S3_KEY

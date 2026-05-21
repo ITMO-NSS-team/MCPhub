@@ -15,7 +15,7 @@ anymore.
 ```bash
 cd automl
 cp .env.example .env
-# edit .env: set ENDPOINT_URL / ACCESS_KEY / SECRET_KEY / BUCKET_NAME / STATE_S3_KEY
+# edit .env: set ENDPOINT_URL / ACCESS_KEY / SECRET_KEY / BUCKET_NAME
 ```
 
 Minimum variables (see `.env.example` for the full list):
@@ -25,7 +25,6 @@ Minimum variables (see `.env.example` for the full list):
 | `ENDPOINT_URL` | S3-compatible endpoint (e.g. `http://10.32.1.114:9000`) |
 | `ACCESS_KEY` / `SECRET_KEY` | S3 credentials |
 | `BUCKET_NAME` | Bucket for `train/`, `ml_weights/`, `predictions/`, `state/` |
-| `STATE_S3_KEY` | S3 key for the shared `state.json` (default `state/state.json`) |
 | `MOLS_ML_MCP_PORT` | MCP HTTP port inside the container (default `8777`) |
 | `MCP_HOST` / `MCP_TRANSPORT` | `0.0.0.0` / `http` |
 

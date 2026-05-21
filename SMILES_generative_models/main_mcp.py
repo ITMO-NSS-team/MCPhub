@@ -788,7 +788,35 @@ def generate_case_mols(
     )
 
 
+_LOCAL_STATE_PATH = "autotrain/utils/state.json"
+
+
+def _eager_startup_sync() -> None:
+    """Pull the shared state.json from S3 before serving any MCP traffic.
+
+    Fail-soft: if S3 is unreachable or the state object does not yet exist,
+    log a warning and let the server start anyway — the FastAPI side will
+    re-attempt the lazy sync on its first relevant call. Keeps cold-start
+    fast while making sure the FastAPI process (which lives in the same
+    container) reads a fresh state file from disk when it boots.
+    """
+    try:
+        from autotrain.utils.state_s3 import download_state_file
+    except ImportError as exc:
+        print(f"[startup] WARN: cannot import download_state_file ({exc}); skipping state sync.")
+        return
+    try:
+        download_state_file(local_path=_LOCAL_STATE_PATH)
+        print(f"[startup] state.json synced from S3 -> {_LOCAL_STATE_PATH}")
+    except Exception as exc:
+        print(
+            f"[startup] WARN: could not sync state.json from S3 "
+            f"({type(exc).__name__}: {exc}). Continuing with empty/stale cache."
+        )
+
+
 if __name__ == "__main__":
+    _eager_startup_sync()
     transport = os.getenv("MCP_TRANSPORT", "http")
     if transport == "http":
         host = os.getenv("MCP_HOST", "0.0.0.0")

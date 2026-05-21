@@ -274,10 +274,35 @@ def _ml_data_to_dict(payload: MLData) -> dict[str, Any]:
 
 
 def _train_ml_worker(payload_data: dict[str, Any]) -> None:
-    """Background worker that syncs state and runs training."""
+    """Background worker that syncs state and runs training.
+
+    On exception (anything reachable from Python — not SIGKILL/OOM), record
+    the error in state.json so the agent can observe `status="Failed"` plus
+    a human-readable `error` field via `check_state`. SIGKILL cases are
+    reconciled separately by `train_ml_job_status`.
+    """
     payload = MLData(**payload_data)
-    _sync_state_from_s3()
-    train_ml_with_data(payload)
+    case = payload.case
+    try:
+        _sync_state_from_s3()
+        train_ml_with_data(payload)
+    except Exception as exc:
+        try:
+            from utils.base_state import TrainState as _TrainState  # noqa: WPS433
+        except ImportError:
+            from .utils.base_state import TrainState as _TrainState  # type: ignore[no-redef]
+        try:
+            state = _TrainState(state_path=str(IMPORT_PATH / STATE_FILE))
+            if case and state(case) is not None:
+                state.ml_model_upd_status(
+                    case=case,
+                    status=3,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+        except Exception as state_exc:
+            print(f"[worker] failed to persist error state for case {case!r}: {state_exc}")
+        # Re-raise so the parent sees a non-zero exitcode.
+        raise
 
 
 @mcp.tool()
@@ -419,7 +444,22 @@ def health_check() -> dict[str, str]:
 def check_state() -> dict[str, Any]:
     """Get current training registry and available calculable properties.
 
-    State is read from local `state.json`.
+    State is read from local `state.json` (re-synced from S3 on every call).
+
+    Per-case schema (under `state[case]["ml_models"]` and
+    `state[case]["generative_models"]`):
+        - `status`: one of `"Not Trained" | "Training" | "Trained" | "Failed"`.
+        - `error`: human-readable error message when `status == "Failed"`,
+          otherwise `null`. Populated automatically when training raises an
+          exception, or when a worker process is killed externally (SIGKILL
+          / OOM — reconciled lazily by `train_ml_job_status`).
+        - `error_at`: ISO-8601 UTC timestamp of the most recent error,
+          or `null`. Cleared on a successful `Trained` transition.
+        - `weights_path`, `metric`, `feature_column`, `target_column`,
+          `Predictable properties`, ...
+
+    Agent contract: branch on `status` first, then read `error`/`error_at`
+    for context when `status == "Failed"`.
 
     Returns:
         Dictionary with fields:
@@ -461,7 +501,11 @@ def train_ml(
     only on the local filesystem of the training container.
 
     Training runs in a background process — the tool returns immediately with
-    `job_id`. Use `train_ml_job_status` to poll status.
+    `job_id`. Use `train_ml_job_status` to poll the OS-level status of the
+    worker, and `check_state` to read case-level status / error context. On
+    failure the case ends up with `ml_models.status="Failed"` plus a
+    human-readable `error` and `error_at` timestamp; agents should branch
+    on `status` and surface `error` to the user.
 
     Required: at least ONE of `regression_props` / `classification_props` must
     be supplied — these drive what is actually fitted. If both are omitted the
@@ -594,6 +638,13 @@ def train_ml_job_status(job_id: str) -> dict[str, Any]:
     """Get status of a background training job started by `train_ml`.
 
     For model-level status/metrics use `check_state` with the corresponding case.
+
+    Side effect (SIGKILL reconciliation): when the worker process died with a
+    non-zero exitcode (e.g. SIGKILL/OOM, which by-passes the worker's
+    try/except), and the case's `ml_models.status` in state.json is still
+    `"Training"`, this tool flips it to `"Failed"` with a synthesized
+    `error="process killed (exitcode=N, likely OOM)"`. This keeps state
+    consistent with what the agent observes via the job-level status.
     """
     meta = _TRAIN_JOB_META.get(job_id)
     process = _TRAIN_JOBS.get(job_id)
@@ -612,6 +663,28 @@ def train_ml_job_status(job_id: str) -> dict[str, Any]:
     else:
         status = "failed"
 
+    reconciled = False
+    if status == "failed":
+        case = meta.get("case")
+        try:
+            state = TrainState(state_path=str(IMPORT_PATH / STATE_FILE))
+            case_state = state(case)
+            if case_state is not None:
+                ml_status = (case_state.get("ml_models") or {}).get("status")
+                if ml_status not in ("Trained", "Failed"):
+                    state.ml_model_upd_status(
+                        case=case,
+                        status=3,
+                        error=(
+                            f"process killed (exitcode={exitcode}). "
+                            "Likely OOM or external SIGKILL — try reducing "
+                            "TRAIN_DATA_LIMIT or freeing memory on the host."
+                        ),
+                    )
+                    reconciled = True
+        except Exception as exc:
+            print(f"[train_ml_job_status] state reconciliation failed for {job_id}: {exc}")
+
     return {
         "job_id": job_id,
         "status": status,
@@ -619,6 +692,7 @@ def train_ml_job_status(job_id: str) -> dict[str, Any]:
         "pid": meta["pid"],
         "started_at": meta["started_at"],
         "exitcode": exitcode,
+        "state_reconciled": reconciled,
     }
 
 
@@ -893,7 +967,26 @@ def predict_ml(
     return result
 
 
+def _eager_startup_sync() -> None:
+    """Pull the shared state.json from S3 before serving any MCP traffic.
+
+    Fail-soft: if S3 is unreachable or the state object does not yet exist,
+    log a warning and let the server start anyway — the first MCP call will
+    then re-attempt the lazy sync. This keeps cold-start fast and surfaces
+    the bucket contents to `check_state` without waiting for a user request.
+    """
+    try:
+        local_path = _sync_state_from_s3()
+        print(f"[startup] state.json synced from S3 -> {local_path}")
+    except Exception as exc:
+        print(
+            f"[startup] WARN: could not sync state.json from S3 "
+            f"({type(exc).__name__}: {exc}). Continuing with empty/stale cache."
+        )
+
+
 if __name__ == "__main__":
+    _eager_startup_sync()
     transport = os.getenv("MCP_TRANSPORT", "http")
     if transport == "http":
         host = os.getenv("MCP_HOST", "0.0.0.0")
