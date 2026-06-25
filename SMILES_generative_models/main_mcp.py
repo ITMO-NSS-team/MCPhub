@@ -829,13 +829,39 @@ def generate_case_mols(
 
     Args:
         case:
-            Disease case selector (case-insensitive). Supported values:
-            - `skleroz` -> multiple sclerosis (BTK target).
-            - `parkinson` -> Parkinson's disease (tyrosine-protein kinase ABL).
-            - `cancer` -> cancer (8afb protein).
-            - `dyslipidemia` -> dyslipidemia (ATP citrate synthase).
-            - `drug_resist` -> drug-resistance ("tablet" weights).
-            - `alzheimer` -> Alzheimer's disease (4j1r target).
+            Disease case selector (case-insensitive). Each case is tuned around
+            a PRIMARY protein target (the one the CVAE was conditioned on and
+            docked against); the underlying disease datasets also reference
+            SECONDARY targets, listed here for biological context. Supported
+            values:
+            - `skleroz`      -> multiple sclerosis. Primary target: Bruton's
+              tyrosine kinase (BTK, TEC family of tyrosine kinases), which
+              drives B-cell and microglial neuroinflammation; designs often
+              add selectivity over the related cytoplasmic tyrosine-protein
+              kinase BMX.
+            - `parkinson`    -> Parkinson's disease. Primary target: ABL
+              tyrosine-protein kinase (c-Abl), whose activation promotes
+              α-synuclein aggregation and dopaminergic neuron loss (cf.
+              nilotinib repurposing). Secondary targets in the dataset:
+              catechol O-methyltransferase (COMT), monoamine oxidase B
+              (MAO-B), dopamine D2 / adenosine A2A receptors.
+            - `cancer`       -> (non-small-cell) lung cancer. Primary target:
+              KRAS G12C mutant (PDB 8AFB), with required selectivity over the
+              HRAS and NRAS isoforms.
+            - `dyslipidemia` -> dyslipidemia. Primary targets: proprotein
+              convertase subtilisin/kexin type 9 (PCSK9) and ATP citrate
+              synthase (ACLY). Secondary targets in the dataset: PPAR-α, CETP,
+              HMG-CoA reductase, NPC1L1, ANGPTL3, MTP.
+            - `drug_resist`  -> cancer multidrug / chemo-resistance ("tablet"
+              weights). Primary target: signal transducer and activator of
+              transcription 3 (STAT3). Secondary targets in the dataset: ABC
+              transporters / P-glycoprotein (P-gp) efflux pumps, heat-shock
+              proteins, PI3K, Ras-Raf-MEK-ERK pathway.
+            - `alzheimer`    -> Alzheimer's disease. Primary target: glycogen
+              synthase kinase-3 beta (GSK-3β; PDB 4J1R), which drives tau
+              hyperphosphorylation. Secondary targets in the dataset:
+              acetylcholinesterase (AChE), tau protein kinases, amyloid-beta
+              aggregation, NMDA receptor.
         num:
             Number of molecules requested. Default `10`. Backend hard-caps
             at 100 — larger values are silently truncated.
