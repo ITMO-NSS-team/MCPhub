@@ -113,9 +113,9 @@ config = {
     "LogP" : logP,
     "Polar Surface Area": polar_surf_area,
     "H-bond Donors": h_bound_donors,
-    "H-bond Acceptors": aromatic_rings,
+    "H-bond Acceptors": h_bound_acceptors,
     "Rotatable Bonds": rotatable_bonds,
-    "Aromatic Rings": h_bound_acceptors,
+    "Aromatic Rings": aromatic_rings,
     "Glaxo" : eval_glaxo,
     "SureChEMBL" : eval_sure_chembl,
     "PAINS" : eval_pains

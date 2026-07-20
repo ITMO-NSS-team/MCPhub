@@ -61,6 +61,9 @@ GAN_GENERATED_PROPERTIES = [
 ]
 
 # Base properties returned by disease-specific generation endpoints (case_generator).
+# `KI` is NOT here: api_utils.case_generator only emits it for `case_ == 'Dslpdm'`
+# (every other case has `'KI': None` in its evaluator table), so listing it
+# unconditionally advertises a column five of the six cases never produce.
 CASE_GENERATED_PROPERTIES = [
     "Molecules",
     "QED",
@@ -71,8 +74,10 @@ CASE_GENERATED_PROPERTIES = [
     "Brenk",
     "BBB",
     "IC50",
-    "KI",
 ]
+
+# dyslipidemia additionally gets a KI column.
+CASE_GENERATED_PROPERTIES_DYSLIPIDEMIA = CASE_GENERATED_PROPERTIES + ["KI"]
 
 CASE_ENDPOINTS: Dict[str, str] = {
     "skleroz": "search_Skleroz",
@@ -82,6 +87,94 @@ CASE_ENDPOINTS: Dict[str, str] = {
     "drug_resist": "search_Drug_resist",
     "alzheimer": "search_Alzheimer",
 }
+
+# ---------------------------------------------------------------------------
+# Shared target vocabulary — keep in sync with automl/automl_mcp.py
+# ---------------------------------------------------------------------------
+# The two servers, the benchmark dataset and the state registry historically
+# used four different spellings for the same target (`sclerosis` / `skleroz` /
+# `Skleroz`; `lung cancer` / `cancer`). Callers should not have to know which
+# dialect a given tool speaks, so both servers accept ALL of them and normalize
+# internally. `automl_mcp._TARGET_REGISTRY` is the mirror of this table; the
+# canonical value here is the CVAE case slug, there it is the AutoML case name.
+#
+# Duplicated rather than imported because the two servers ship as separate
+# images with different Python versions. If this drifts, `generate_case_mols`
+# and `predict_ml` will disagree about what a disease name means.
+
+_TARGET_ALIASES: Dict[str, tuple] = {
+    "alzheimer": (
+        "alzheimer", "alzheimers", "alzheimer's disease", "alzheimer disease",
+        "gsk-3beta", "gsk3beta", "gsk-3b", "gsk3b", "gsk-3", "gsk3",
+        "glycogen synthase kinase 3 beta", "glycogen synthase kinase-3 beta",
+        "glycogen synthase kinase 3", "4j1r", "tau kinase", "tau protein kinase",
+    ),
+    "skleroz": (
+        "skleroz", "sclerosis", "multiple sclerosis", "ms",
+        "btk", "bruton's tyrosine kinase", "brutons tyrosine kinase",
+        "bruton tyrosine kinase", "tyrosine-protein kinase btk",
+        "tyrosine protein kinase btk", "btk domain", "5vfi", "bmx", "tec family",
+    ),
+    "cancer": (
+        "cancer", "lung cancer", "nsclc", "non-small cell lung cancer",
+        "non small cell lung cancer", "kras", "kras g12c", "g12c", "k-ras",
+        "hras", "nras", "8afb",
+    ),
+    "parkinson": (
+        "parkinson", "parkinsons", "parkinson's disease", "parkinson disease",
+        "c-abl", "cabl", "abl", "abl kinase", "abl tyrosine-protein kinase",
+        "tyrosine-protein kinase abl", "alpha-synuclein", "a-synuclein",
+        "comt", "catechol o-methyltransferase", "mao-b", "monoamine oxidase b",
+        "dopamine d2", "adenosine a2a",
+    ),
+    "dyslipidemia": (
+        "dyslipidemia", "dyslipidaemia", "hyperlipidemia", "hypercholesterolemia",
+        "pcsk9", "proprotein convertase subtilisin/kexin type 9",
+        "proprotein convertase subtilisin kexin type 9",
+        "acly", "atp citrate synthase", "atp citrate lyase",
+        "ppar-alpha", "ppar alpha", "pparalpha",
+        "peroxisome proliferator-activated receptor alpha",
+        "cetp", "cholesteryl ester transfer protein",
+        "hmg-coa reductase", "hmg coa reductase", "npc1l1", "angptl3", "mtp",
+    ),
+    "drug_resist": (
+        "drug_resist", "drug resist", "drug resistance", "drug_resistance",
+        "multidrug resistance", "chemoresistance", "chemo-resistance",
+        "stat3", "signal transducer and activator of transcription 3",
+        "p-glycoprotein", "p-gp", "pgp", "abc transporters", "efflux pumps",
+        "heat shock proteins", "pi3k", "phosphoinositide 3-kinase",
+        "ras-raf-mek-erk", "ras raf mek erk",
+    ),
+}
+
+# Fold Greek to ASCII so `GSK-3β` and `GSK-3beta` land on one key, and
+# `α-synuclein` (the dataset only ever spells it with a Greek alpha) matches.
+_GREEK_FOLD = {
+    "α": "alpha", "Α": "alpha", "β": "beta", "Β": "beta",
+    "γ": "gamma", "Γ": "gamma", "δ": "delta", "Δ": "delta",
+    "μ": "u", "µ": "u", "’": "'", "‘": "'", "–": "-", "—": "-",
+}
+
+
+def _fold_target_text(value: str) -> str:
+    """Normalize a case/protein/disease string for alias matching."""
+    text = (value or "").strip().lower()
+    for src, dst in _GREEK_FOLD.items():
+        text = text.replace(src, dst)
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+_CASE_ALIAS_INDEX: Dict[str, str] = {}
+for _slug, _aliases in _TARGET_ALIASES.items():
+    for _alias in (_slug, *_aliases):
+        _folded = _fold_target_text(_alias)
+        if _folded:
+            _CASE_ALIAS_INDEX.setdefault(_folded, _slug)
+
+
+def _resolve_case_slug(case: Optional[str]) -> Optional[str]:
+    """Map any accepted disease/protein spelling to a CVAE case slug."""
+    return _CASE_ALIAS_INDEX.get(_fold_target_text(case or ""))
 
 
 def _resolve_base_url(selector: str) -> str:
@@ -580,7 +673,19 @@ def start_generative_model_training(
     save_trained_data_to_sync_server: bool = True,
 ) -> Dict[str, Any]:
     """
-    Starts GAN generative training. The training CSV is always supplied as an
+    OFFLINE OPERATOR TOOL — fits a NEW GAN from a SMILES dataset you already
+    own. This is NOT how you generate molecules for a request.
+
+    To generate molecules, call `generate_case_mols` (alzheimer/GSK-3beta,
+    skleroz/BTK, cancer/KRAS G12C, parkinson/c-Abl, dyslipidemia/PCSK9,
+    drug_resist/STAT3 — all pre-trained, weights bundled) or `generate_mols`
+    for a generic batch. Neither needs training.
+
+    Do NOT call this tool during an agent run: it BLOCKS for up to ~19 minutes,
+    consumes the run budget, and yields nothing a subsequent step can use. Use
+    it only when an operator is deliberately onboarding a new target dataset.
+
+    The training CSV is always supplied as an
     HTTP(S) URL (e.g. an S3 presigned URL), which the training backend fetches
     via plain `requests.get(...)`. No S3 credentials are required for the read,
     so the URL may point at any reachable endpoint / account.
@@ -600,7 +705,7 @@ def start_generative_model_training(
     Args:
         case_name:
             Unique case identifier used to name and track the training run.
-            Use `list_s3_train_cases` to discover available datasets.
+            Use `list_generative_train_cases` to discover available datasets.
         train_data_url:
             Required HTTP(S) URL of the training CSV — typically an S3
             presigned URL. The training server downloads it directly; the
@@ -692,10 +797,28 @@ def generate_mols(
 
     Model: GAN-LSTM (`gan_auto_generator` on the FastAPI side). One forward
     pass per batch — no iterative novelty/property filtering loop, no docking,
-    no IC50 evaluation. Returns the SMILES plus a fixed set of RDKit-computed
-    properties (`QED`, `LogP`, `Synthetic Accessibility`, `Brenk`, `PAINS`,
-    `Glaxo`, `SureChEMBL`, `Polar Surface Area`, H-bond/Rotatable/Aromatic
-    counters, `Validity`, `Duplicates`).
+    no IC50 evaluation.
+
+    Output table — 15 columns, in this order:
+        `Smiles`
+            The generated molecules. Only those RDKit could parse survive, so
+            the row count is normally LESS than `num`.
+        Per-molecule RDKit properties (one value per row):
+            `Brenk`, `QED`, `Synthetic Accessibility`, `LogP`,
+            `Polar Surface Area`, `H-bond Donors`, `H-bond Acceptors`,
+            `Rotatable Bonds`, `Aromatic Rings`, `Glaxo`, `SureChEMBL`,
+            `PAINS`.
+        `Validity`, `Duplicates`
+            BATCH statistics, NOT per-molecule values — the fraction of
+            generated SMILES that parsed, and the fraction of the valid ones
+            that are duplicates. Each is one number repeated identically on
+            every row. In particular `Validity` is not a per-row flag: every
+            row in the table is already valid by construction. Report them as
+            batch quality metrics, never as a property of a single molecule.
+
+    No `IC50`, `KI`, `BBB` or `docking_score` here. For potency use
+    `generate_case_mols` (disease-tuned CVAE, ships IC50 + BBB) or
+    `predict_ml(protein=...)` on the AutoML server.
 
     Two operating modes:
 
@@ -714,14 +837,17 @@ def generate_mols(
        — there is NO silent fallback to the generic GAN.
 
     Typical agent workflow: `generate_mols(num=...)` → pipe SMILES into
-    `predict_ml(case=..., smiles_list=...)` for property prediction. If the
-    results are insufficient, request more molecules — no retraining needed.
+    `predict_ml(protein="GSK-3beta", smiles_list=...)` on the AutoML server for
+    property prediction. If the results are insufficient, request more
+    molecules — no retraining needed, ever.
 
-    For the 6 hard-coded disease cases (alzheimer, parkinson, cancer,
-    skleroz, dyslipidemia, drug_resist) prefer `generate_case_mols` — it
-    runs a different, slower model (multi-property CVAE) tuned for those
-    targets with property constraints. Do NOT use those names here unless
-    you have separately trained a GAN under that case name.
+    For the 6 hard-coded disease cases (alzheimer/GSK-3beta,
+    parkinson/c-Abl, cancer/KRAS G12C, skleroz/BTK, dyslipidemia/PCSK9,
+    drug_resist/STAT3) prefer `generate_case_mols` — it runs a different,
+    slower model (multi-property CVAE) tuned for those targets with property
+    constraints, and its CSV already includes IC50 and BBB (KI for
+    dyslipidemia only). Do NOT use those names here unless you have separately
+    trained a GAN under that case name.
 
     Output contract:
         By default the full generated table (SMILES + calculated properties)
@@ -787,8 +913,45 @@ def generate_case_mols(
     return_inline_results: bool = False,
 ) -> Dict[str, Any]:
     """
-    Generate molecules for a HARDCODED disease case using a multi-property
-    conditional VAE — SLOWER but tuned for specific therapeutic targets.
+    Generate drug-like molecules for a disease / protein target. PRE-TRAINED —
+    weights ship with the image, so NO TRAINING IS EVER NEEDED. Do NOT call
+    `start_generative_model_training` or `train_ml` for these six targets.
+
+    `case` is CASE-INSENSITIVE and accepts disease names, protein names and PDB
+    IDs interchangeably — every alias on a line below resolves to that line's
+    case, so `case="sclerosis"`, `case="Skleroz"`, `case="BTK"` and
+    `case="5VFI"` are all the same call. The same vocabulary works as
+    `predict_ml(protein=...)` / `predict_ml(disease=...)` on the AutoML server.
+
+    Pick `case` by target protein:
+        case="alzheimer"    — GSK-3beta / GSK-3β / glycogen synthase kinase 3
+                              beta / 4J1R / tau kinase / Alzheimer's disease
+        case="skleroz"      — BTK / Bruton's tyrosine kinase / 5VFI / BMX /
+                              TEC family / multiple sclerosis / sclerosis
+        case="cancer"       — KRAS G12C / 8AFB / HRAS / NRAS / NSCLC /
+                              non-small cell lung cancer / lung cancer
+        case="parkinson"    — c-Abl / ABL kinase / α-synuclein / COMT / MAO-B /
+                              dopamine D2 / adenosine A2A / Parkinson's disease
+        case="dyslipidemia" — PCSK9 / ACLY / ATP citrate lyase / PPAR-alpha /
+                              CETP / HMG-CoA reductase / ANGPTL3 / dyslipidemia
+        case="drug_resist"  — STAT3 / P-glycoprotein / ABC transporters /
+                              efflux pumps / PI3K / heat-shock proteins /
+                              multidrug resistance / chemoresistance
+
+    The output CSV ALREADY CONTAINS IC50 and BBB, plus QED, Synthetic
+    Accessibility, PAINS, SureChEMBL, Glaxo and Brenk — and KI for
+    case="dyslipidemia" ONLY (the other five cases have no KI evaluator and
+    emit no KI column). Do not call `predict_ml` to re-derive those columns —
+    read the CSV.
+
+    Scope limits — state these rather than implying they were computed:
+        - The CVAE is conditioned on ONE primary target per case (listed first
+          above). Secondary targets are dataset context, not separate models.
+        - NO selectivity or anti-target screening is performed. Nothing here
+          scores HRAS, NRAS or BMX, so a `cancer` batch is NOT demonstrated
+          selective over HRAS/NRAS. For on-target docking_score on GSK-3beta or
+          BTK, chain into `predict_ml(protein="GSK-3beta"|"BTK", ...)`.
+        - No docking is run at generation time.
 
     Model: 8-property conditional CVAE (`multi_generator` on the FastAPI side
     invoked through one of the `/search_*` endpoints) with case-specific
@@ -800,6 +963,10 @@ def generate_case_mols(
         parkinson    -> autotrain/many_prop_CVAE/weights_parkinson/
         dyslipidemia -> autotrain/many_prop_CVAE/weights_dislip/
         drug_resist  -> autotrain/many_prop_CVAE/weights_8p_tablet/
+
+    These weights are bundled and are INDEPENDENT of the case registry shown by
+    `get_state_from_server` — a case can generate here while showing no trained
+    GAN there. Do not consult that registry to decide whether generation works.
 
     Unlike `generate_mols`, the backend applies property constraints
     (`spec_conds` — windows on docking_score, QED, Synthetic Accessibility,
@@ -883,11 +1050,17 @@ def generate_case_mols(
     Raises:
         ValueError: If case is not supported.
     """
-    case_key = (case or "").strip().lower()
+    # Accept any spelling the benchmark / AutoML server / a user might use:
+    # "sclerosis", "Skleroz", "BTK", "multiple sclerosis" all mean `skleroz`.
+    case_key = _resolve_case_slug(case) or (case or "").strip().lower()
     endpoint = CASE_ENDPOINTS.get(case_key)
     if endpoint is None:
         supported = ", ".join(sorted(CASE_ENDPOINTS.keys()))
-        raise ValueError(f"Unsupported case '{case}'. Supported cases: {supported}")
+        raise ValueError(
+            f"Unsupported case '{case}'. Supported cases: {supported}. "
+            "Disease names, protein names and PDB IDs are also accepted "
+            "(e.g. 'sclerosis', 'BTK', 'KRAS G12C', 'GSK-3beta', '4J1R')."
+        )
     raw = _generate_case_mols(endpoint, num)
     return _maybe_upload_generation_result(
         raw_result=raw,

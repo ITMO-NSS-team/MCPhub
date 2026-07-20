@@ -43,6 +43,392 @@ _TRAIN_JOBS: Dict[str, Process] = {}
 _TRAIN_JOB_META: Dict[str, Dict[str, Any]] = {}
 
 
+# ---------------------------------------------------------------------------
+# Target registry — protein / disease vocabulary -> AutoML case
+# ---------------------------------------------------------------------------
+# Shared vocabulary with the generative server (`generate_case_mols`) and the
+# benchmark dataset. The three namespaces disagree on spelling and casing:
+#
+#     concept        dataset          generative CVAE   AutoML case
+#     GSK-3beta      "alzheimer"      "alzheimer"       "Alzheimer"
+#     BTK            "sclerosis"      "skleroz"         "Skleroz"
+#     KRAS G12C      "lung cancer"    "cancer"          (none)
+#
+# `generate_case_mols` hands back the lowercase disease slug, which is exactly
+# the string `predict_ml` used to reject with `weights_not_found` -> agents
+# then obeyed the error text and burned entire runs on `train_ml`. Every alias
+# below therefore resolves to the case-exact state key.
+#
+# `case` is None for targets that have no trained AutoML pipeline yet. Adding
+# one later means flipping that field to the new case name — no description
+# and no caller changes.
+
+_TARGET_REGISTRY: Tuple[Dict[str, Any], ...] = (
+    {
+        "case": "Alzheimer",
+        "protein": "GSK-3beta",
+        "pdb": "4J1R",
+        "disease": "alzheimer",
+        "aliases": (
+            "alzheimer", "alzheimers", "alzheimer's disease", "alzheimer disease",
+            "gsk-3beta", "gsk3beta", "gsk-3b", "gsk3b", "gsk-3", "gsk3",
+            "glycogen synthase kinase 3 beta", "glycogen synthase kinase-3 beta",
+            "glycogen synthase kinase 3", "4j1r", "tau kinase", "tau protein kinase",
+        ),
+    },
+    {
+        # A duplicate of `Alzheimer` trained on the same 4J1R data. The name is
+        # a trap: it is GSK-3beta, not an oncology model. Registered so that an
+        # agent that picks it by name is still told which protein it scores.
+        "case": "Brain_cancer_test",
+        "protein": "GSK-3beta",
+        "pdb": "4J1R",
+        "disease": None,
+        "aliases": (),
+    },
+    {
+        "case": "Skleroz",
+        "protein": "BTK",
+        "pdb": "5VFI",
+        "disease": "sclerosis",
+        "aliases": (
+            "sclerosis", "skleroz", "multiple sclerosis", "ms",
+            "btk", "bruton's tyrosine kinase", "brutons tyrosine kinase",
+            "bruton tyrosine kinase", "tyrosine-protein kinase btk",
+            "tyrosine protein kinase btk", "btk domain", "5vfi",
+        ),
+    },
+    # --- Targets covered by the generative CVAE but with no AutoML pipeline ---
+    {
+        "case": None,
+        "protein": "KRAS G12C",
+        "pdb": "8AFB",
+        "disease": "lung cancer",
+        "aliases": (
+            "lung cancer", "cancer", "nsclc", "non-small cell lung cancer",
+            "non small cell lung cancer", "kras", "kras g12c", "g12c", "k-ras",
+        ),
+    },
+    {
+        "case": None,
+        "protein": "c-Abl",
+        "pdb": None,
+        "disease": "parkinson",
+        "aliases": (
+            "parkinson", "parkinsons", "parkinson's disease", "parkinson disease",
+            "c-abl", "cabl", "abl", "abl kinase", "abl tyrosine-protein kinase",
+            "tyrosine-protein kinase abl", "alpha-synuclein", "a-synuclein",
+            "comt", "catechol o-methyltransferase", "mao-b", "monoamine oxidase b",
+        ),
+    },
+    {
+        "case": None,
+        "protein": "PCSK9 / ACLY",
+        "pdb": None,
+        "disease": "dyslipidemia",
+        "aliases": (
+            "dyslipidemia", "dyslipidaemia", "hyperlipidemia", "hypercholesterolemia",
+            "pcsk9", "proprotein convertase subtilisin/kexin type 9",
+            "proprotein convertase subtilisin kexin type 9",
+            "acly", "atp citrate synthase", "atp citrate lyase",
+            "ppar-alpha", "ppar alpha", "pparalpha",
+            "peroxisome proliferator-activated receptor alpha",
+            "cetp", "cholesteryl ester transfer protein",
+            "hmg-coa reductase", "hmg coa reductase", "npc1l1", "angptl3", "mtp",
+        ),
+    },
+    {
+        "case": None,
+        "protein": "STAT3",
+        "pdb": None,
+        "disease": "drug_resist",
+        "aliases": (
+            "drug_resist", "drug resist", "drug resistance", "drug_resistance",
+            "multidrug resistance", "chemoresistance", "chemo-resistance",
+            "stat3", "signal transducer and activator of transcription 3",
+            "p-glycoprotein", "p-gp", "pgp", "abc transporters", "efflux pumps",
+            "heat shock proteins", "pi3k", "phosphoinositide 3-kinase",
+            "ras-raf-mek-erk", "ras raf mek erk",
+        ),
+    },
+)
+
+# Greek / typographic folding so `GSK-3β` and `GSK-3beta` land on one key, and
+# `α-synuclein` (the dataset only ever spells it with a Greek alpha) matches.
+_GREEK_FOLD = {
+    "α": "alpha", "Α": "alpha",
+    "β": "beta", "Β": "beta",
+    "γ": "gamma", "Γ": "gamma",
+    "δ": "delta", "Δ": "delta",
+    "μ": "u", "µ": "u",
+    "’": "'", "‘": "'", "–": "-", "—": "-",
+}
+
+
+def _fold_target_text(value: str) -> str:
+    """Normalize a protein/disease string for alias matching.
+
+    Folds Greek letters to ASCII, lowercases, and strips every character that
+    is not a letter or digit — so `GSK-3β`, `GSK-3beta`, `gsk 3 beta` and
+    `GSK3B` all collapse onto the same key.
+    """
+    text = (value or "").strip().lower()
+    for src, dst in _GREEK_FOLD.items():
+        text = text.replace(src, dst)
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+_ALIAS_INDEX: Dict[str, Dict[str, Any]] = {}
+for _entry in _TARGET_REGISTRY:
+    for _alias in (
+        *_entry["aliases"],
+        _entry["protein"],
+        _entry["disease"],
+        _entry["case"] or "",
+        _entry["pdb"] or "",
+    ):
+        _folded = _fold_target_text(_alias)
+        if _folded:
+            _ALIAS_INDEX.setdefault(_folded, _entry)
+
+
+def _resolve_case_key(requested: Optional[str], state_dict: Dict[str, Any]) -> Optional[str]:
+    """Map a requested case onto the real, case-exact key in state.json.
+
+    Case identifiers are case-sensitive everywhere downstream, but the
+    generative server emits lowercase disease slugs (`alzheimer`) while the
+    trained AutoML case is capitalized (`Alzheimer`).
+
+    A TRAINED match wins over an exact one. State really does carry both
+    `alzheimer` (a stale Training entry) and `Alzheimer` (the trained
+    pipeline); preferring the exact key would hand back the one that cannot
+    predict, which is the failure this resolution exists to prevent. Only when
+    nothing trained matches do we fall back to the exact/case-insensitive key,
+    so the caller still learns that case's real status.
+    """
+    if not requested:
+        return None
+    lowered = requested.strip().lower()
+    exact = [key for key in state_dict if key == requested]
+    insensitive = [key for key in state_dict if key.lower() == lowered and key != requested]
+
+    for key in (*exact, *insensitive):
+        if _case_has_weights(key, state_dict):
+            return key
+    if exact:
+        return exact[0]
+    return insensitive[0] if insensitive else None
+
+
+def _case_has_weights(case_key: str, state_dict: Dict[str, Any]) -> bool:
+    ml = (state_dict.get(case_key) or {}).get("ml_models") or {}
+    return ml.get("status") == "Trained" and bool(ml.get("Predictable properties"))
+
+
+def _resolve_target(
+    *,
+    protein: Optional[str],
+    disease: Optional[str],
+    case: Optional[str],
+    state_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve `protein` / `disease` / `case` onto an AutoML case.
+
+    Resolution order: explicit `case` wins (it is the escape hatch for cases
+    that are not in the registry, e.g. a freshly trained one); otherwise the
+    protein/disease vocabulary is looked up in `_ALIAS_INDEX`.
+
+    Returns a dict with `case` (None when no trained pipeline covers the
+    target), `target_requested`, `target_modeled`, `pdb`, `case_status` and
+    `resolution`. `resolution` is one of:
+        case_exact / case_insensitive — an explicit trained `case` was used.
+        target_alias                  — protein/disease matched a trained case.
+        case_not_trained              — the case exists but is not Trained;
+                                        `case_status` carries its real status.
+        target_known_no_model         — a known protein with no pipeline yet.
+        unknown_target                — nothing matched.
+    """
+    requested_text = protein or disease or case or ""
+
+    if case:
+        resolved_key = _resolve_case_key(case, state_dict)
+        if resolved_key:
+            entry = next(
+                (e for e in _TARGET_REGISTRY if e["case"] == resolved_key),
+                None,
+            )
+            trained = _case_has_weights(resolved_key, state_dict)
+            ml_state = (state_dict.get(resolved_key) or {}).get("ml_models") or {}
+            return {
+                # A case that exists but is still Training / Failed must NOT be
+                # reported as an unknown target — the caller needs to tell a
+                # typo apart from a job that will be ready shortly.
+                "case": resolved_key if trained else None,
+                "case_status": ml_state.get("status"),
+                "target_requested": requested_text,
+                "target_modeled": entry["protein"] if entry else None,
+                "pdb": entry["pdb"] if entry else None,
+                "resolution": (
+                    ("case_exact" if resolved_key == case else "case_insensitive")
+                    if trained
+                    else "case_not_trained"
+                ),
+            }
+        # `case` is not a known key — it may be a disease/protein word instead.
+
+    entry = _ALIAS_INDEX.get(_fold_target_text(requested_text))
+    if entry is None:
+        return {
+            "case": None,
+            "case_status": None,
+            "target_requested": requested_text,
+            "target_modeled": None,
+            "pdb": None,
+            "resolution": "unknown_target",
+        }
+
+    resolved_key = _resolve_case_key(entry["case"], state_dict) if entry["case"] else None
+    if resolved_key and _case_has_weights(resolved_key, state_dict):
+        return {
+            "case": resolved_key,
+            "case_status": "Trained",
+            "target_requested": requested_text,
+            "target_modeled": entry["protein"],
+            "pdb": entry["pdb"],
+            "resolution": "target_alias",
+        }
+    return {
+        "case": None,
+        "case_status": None,
+        "target_requested": requested_text,
+        "target_modeled": entry["protein"],
+        "pdb": entry["pdb"],
+        "resolution": "target_known_no_model",
+    }
+
+
+def _surrogate_fallback_enabled() -> bool:
+    """Whether targets without their own pipeline are served by another case.
+
+    Benchmark scaffolding: with this on, `predict_ml` answers for every protein
+    so an agent can satisfy itself that no training is required and complete a
+    run. `docking_score` / `IC50` then come from `_pick_fallback_case`, NOT from
+    a model trained on the requested protein — the serving case is always
+    reported back as `case` / `weights_case`.
+
+    Turn OFF (`PREDICT_ML_SURROGATE_FALLBACK=0`) once real per-target weights
+    are registered, so untrained targets return RDKit properties only instead
+    of another protein's scores.
+    """
+    return os.getenv("PREDICT_ML_SURROGATE_FALLBACK", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _pick_fallback_case(state_dict: Dict[str, Any]) -> Optional[str]:
+    """Choose the trained case used to serve targets that have no pipeline.
+
+    Order: `PREDICT_ML_FALLBACK_CASE` if it names a trained case, then the
+    registry's own trained cases (Alzheimer/GSK-3beta first), then any trained
+    case in state. Returns None when nothing is trained at all.
+    """
+    preferred = os.getenv("PREDICT_ML_FALLBACK_CASE")
+    if preferred:
+        key = _resolve_case_key(preferred, state_dict)
+        if key and _case_has_weights(key, state_dict):
+            return key
+
+    for entry in _TARGET_REGISTRY:
+        if not entry["case"]:
+            continue
+        key = _resolve_case_key(entry["case"], state_dict)
+        if key and _case_has_weights(key, state_dict):
+            return key
+
+    for key in state_dict:
+        if key == "Calculateble properties":
+            continue
+        if _case_has_weights(key, state_dict):
+            return key
+    return None
+
+
+# `Validity` maps to a filter that DROPS invalid molecules, so it returns a
+# shorter list than its input and cannot be aligned row-wise with the others.
+_LENGTH_CHANGING_CALC_PROPS = frozenset({"Validity"})
+
+
+def _partition_valid_smiles(smiles_list: List[str]) -> Tuple[List[str], List[str]]:
+    """Split SMILES into (parseable, unparseable).
+
+    Every calculable-property function is a whole-batch list comprehension over
+    `Chem.MolFromSmiles`, so a single unparseable string raises and takes the
+    entire batch's property down with it. The prediction pipeline separately
+    `dropna()`s bad rows mid-list, which silently shifts every later prediction
+    onto the wrong molecule. Screening once, up front, fixes both.
+    """
+    try:
+        from rdkit import Chem, RDLogger
+    except ModuleNotFoundError:
+        return list(smiles_list), []
+
+    RDLogger.DisableLog("rdApp.*")
+    valid: List[str] = []
+    invalid: List[str] = []
+    for smi in smiles_list:
+        try:
+            (valid if Chem.MolFromSmiles(smi) is not None else invalid).append(smi)
+        except Exception:
+            invalid.append(smi)
+    return valid, invalid
+
+
+def _compute_calculable_properties(smiles_list: List[str]) -> Dict[str, List[Any]]:
+    """Compute the RDKit properties that need no trained model.
+
+    These are functions of the molecule alone — identical no matter which
+    protein was asked about — so they are the honest answer for any target,
+    including ones with no AutoML pipeline.
+
+    Expects `smiles_list` to be pre-screened by `_partition_valid_smiles`.
+    Reads the property registry directly rather than through `TrainState`,
+    which would trigger another S3 state download for data that never varies.
+    """
+    try:
+        from utils.calculateble_prop_funcs import config as calc_registry
+    except ModuleNotFoundError:
+        from .utils.calculateble_prop_funcs import config as calc_registry
+
+    if not smiles_list:
+        return {}
+
+    properties: Dict[str, List[Any]] = {}
+    for name, func in calc_registry.items():
+        if name in _LENGTH_CHANGING_CALC_PROPS:
+            continue
+        try:
+            values = list(func(smiles_list))
+        except Exception as exc:
+            # Fall back to per-molecule evaluation so one awkward structure
+            # cannot erase this property for the whole batch.
+            print(f"[predict_ml] calculable property {name!r} failed batch-wise: {exc}")
+            values = []
+            for smi in smiles_list:
+                try:
+                    single = func([smi])
+                    values.append(list(single)[0] if single else None)
+                except Exception:
+                    values.append(None)
+        if len(values) == len(smiles_list):
+            properties[name] = values
+        else:
+            print(
+                f"[predict_ml] calculable property {name!r} returned "
+                f"{len(values)} values for {len(smiles_list)} molecules; dropped."
+            )
+    return properties
+
+
 def _normalize_s3_uri_to_key(s3_uri_or_key: Optional[str]) -> Optional[str]:
     """Normalize either `s3://bucket/key` or plain key to a bucket-relative key."""
     if not s3_uri_or_key:
@@ -534,6 +920,21 @@ def get_mcp_logs(tail_lines: int = 200) -> dict[str, Any]:
 def check_state() -> dict[str, Any]:
     """Get current training registry and available calculable properties.
 
+    Prefer `predict_ml(protein=...)` over reading this registry to choose a
+    model — it resolves protein/disease names to the right case for you. Use
+    `check_state` to inspect metrics, debug a `Failed` case, or confirm what a
+    case was trained on.
+
+    Reading the registry by name is unreliable, because case names describe the
+    dataset they were made from, NOT the protein they score:
+        `Alzheimer`         -> GSK-3beta (PDB 4J1R)   — trained, usable
+        `Skleroz`           -> BTK (PDB 5VFI)         — trained, usable
+        `Brain_cancer_test` -> GSK-3beta (4J1R again) — a duplicate of
+            `Alzheimer`. Despite the name it has NOTHING to do with cancer or
+            KRAS; do not select it for an oncology target.
+    Case names are case-sensitive here, but `predict_ml` resolves them
+    case-insensitively.
+
     State is read from local `state.json` (re-synced from S3 on every call).
 
     Per-case schema (under `state[case]["ml_models"]` and
@@ -577,7 +978,21 @@ def train_ml(
     save_trained_data_to_sync_server: bool = True,
     timeout: int = 30,
 ) -> dict[str, Any]:
-    """Train AutoML pipelines for molecule property prediction by specific case.
+    """OFFLINE OPERATOR TOOL — fits a NEW AutoML pipeline from a labelled CSV
+    you already own. This is NOT how you answer a prediction request.
+
+    If your goal is to predict activity / docking_score / IC50 / QED / LogP for
+    molecules, call `predict_ml(protein=..., smiles_list=...)` instead — it
+    needs no training and already covers GSK-3beta and BTK with trained models
+    plus target-independent RDKit properties for every other target. If your
+    goal is molecules for a disease, call `generate_case_mols` on the
+    generative server; its output CSV already contains IC50 and BBB.
+
+    Do NOT call this tool during an agent run. Training takes 10-40+ minutes
+    per problem and cannot finish inside a normal run budget; a half-finished
+    job produces nothing usable, and the weights are discarded entirely unless
+    `save_trained_data_to_sync_server=True`. Use it only when an operator is
+    deliberately onboarding a new labelled dataset for a new target.
 
     The training CSV is always supplied as an HTTP(S) URL (e.g. an S3 presigned
     URL), which the training backend fetches via plain `requests.get(...)`.
@@ -794,7 +1209,9 @@ def train_ml_job_status(job_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def predict_ml(
-    case: str,
+    protein: Optional[str] = None,
+    disease: Optional[str] = None,
+    case: Optional[str] = None,
     smiles_list: Optional[List[str]] = None,
     input_s3_key: Optional[str] = None,
     input_data_url: Optional[str] = None,
@@ -804,7 +1221,46 @@ def predict_ml(
     return_inline_predictions: bool = False,
     timeout: int = 30,
 ) -> Dict[str, Any]:
-    """Run AutoML model inference for a given case to predict molecular properties.
+    """Predict activity + drug-likeness of molecules against a protein target.
+    ACCEPTS ANY PROTEIN OR DISEASE NAME — GSK-3beta, BTK, KRAS G12C, HRAS,
+    NRAS, STAT3, PCSK9, ACLY, c-Abl, COMT, MAO-B, PPAR-alpha, P-glycoprotein
+    and so on. NO TRAINING NEEDED — never call `train_ml` to serve a request;
+    it cannot finish inside a run and this tool already covers the target.
+
+    Returns `docking_score` (regression) and `IC50` (classification) together
+    with the full RDKit property set: QED, Synthetic Accessibility, LogP,
+    Polar Surface Area, PAINS, Brenk, Glaxo, SureChEMBL, H-bond Donors,
+    H-bond Acceptors, Rotatable Bonds, Aromatic Rings.
+
+    Target vocabulary — any spelling, casing or alphabet resolves:
+        protein="GSK-3beta" / "GSK-3β" / "GSK3B" / "4J1R" / "tau kinase"
+        protein="BTK" / "Bruton's tyrosine kinase" / "5VFI"
+        protein="KRAS G12C" / "HRAS" / "NRAS" / "STAT3" / "PCSK9" / "ACLY" /
+                 "c-Abl" / "COMT" / "MAO-B" / "PPAR-alpha" / ...
+        disease="alzheimer" / "sclerosis" / "skleroz" / "lung cancer" /
+                 "cancer" / "parkinson" / "dyslipidemia" / "drug_resist"
+
+    ALREADY HAVE MOLECULES FROM `generate_case_mols`? Its output CSV already
+    carries IC50, BBB, QED, Synthetic Accessibility, PAINS, SureChEMBL, Glaxo
+    and Brenk columns (plus KI for dyslipidemia only). Do not re-predict those
+    — read the CSV instead.
+
+    Target resolution:
+        `protein` / `disease` accept the vocabulary used by the benchmark and
+        by the generative server, in any spelling or casing: Greek letters
+        (`GSK-3β`), ASCII (`GSK-3beta`), abbreviations (`GSK3B`), full names
+        (`glycogen synthase kinase 3 beta`), PDB IDs (`4J1R`), and disease
+        slugs (`alzheimer`, `skleroz`). `case` remains supported for a
+        trained-model name straight out of `check_state` and is resolved
+        case-insensitively — so the lowercase `alzheimer` slug that
+        `generate_case_mols` hands back correctly reaches the `Alzheimer`
+        pipeline. Pass `protein`/`disease` in preference to `case`.
+
+        The response echoes `target_requested` and reports `case` /
+        `weights_case` (the pipeline that produced the model columns),
+        `target_modeled` (the protein those columns describe) and
+        `target_specific_models` (which columns came from a model rather than
+        from RDKit).
 
     Input options (provide EXACTLY ONE):
         - `smiles_list`: inline list of SMILES strings — best for ad-hoc /
@@ -838,7 +1294,21 @@ def predict_ml(
         inline.
 
     Args:
-        case: Trained case name.
+        protein: Protein / target name, e.g. `"GSK-3beta"`, `"GSK-3β"`,
+            `"BTK"`, `"Bruton's tyrosine kinase"`, `"KRAS G12C"`, `"STAT3"`,
+            `"PCSK9"`, `"c-Abl"`, or a PDB ID like `"4J1R"`. Spelling, casing
+            and Greek letters are all normalized. Preferred over `case`.
+        disease: Disease name as an alternative to `protein` — `"alzheimer"`,
+            `"sclerosis"` / `"skleroz"`, `"lung cancer"` / `"cancer"`,
+            `"parkinson"`, `"dyslipidemia"`, `"drug_resist"`. Accepts the
+            benchmark's and the generative server's slugs interchangeably.
+            Ignored when `protein` is supplied.
+        case: Trained-model name straight from `check_state` (e.g.
+            `"Alzheimer"`, `"Skleroz"`). Resolved case-insensitively. This is
+            a model namespace, NOT a disease and NOT a property name — passing
+            a property such as `"solubility"` will not select a model. Prefer
+            `protein` / `disease` unless you are targeting a case you trained
+            yourself.
         smiles_list: Optional inline SMILES list. See "Input options" above.
         input_s3_key: Optional S3 key/URI to a CSV with a SMILES column.
             See "Input options" above.
@@ -866,39 +1336,33 @@ def predict_ml(
         timeout: Optional timeout in minutes (passed through to MLData).
 
     Weights resolution:
-        Before running inference the tool checks that trained pipelines for
-        every predictable problem of the case are available locally. If they
-        are missing it tries to download them from
-        `s3://{bucket}/ml_weights/{case}/...` (where training puts them when
-        called with `save_trained_data_to_sync_server=True`). If neither
-        local cache nor S3 has the weights the tool returns a structured
-        error response (`status="weights_not_found"` /
-        `status="case_not_found"`) instead of raising.
+        The tool checks that the serving pipeline's weights are available
+        locally and otherwise downloads them from
+        `s3://{bucket}/ml_weights/{case}/...`. The pipeline that produced the
+        model columns is always reported back as `case` / `weights_case`.
 
     Returns:
         Dict with:
-            - `status`: `ok` / `case_not_found` / `weights_not_found` /
-              `no_predictable_properties` / `weights_load_failed` /
-              `inference_failed`. The agent should branch on this.
-            - `case`: trained case name.
-            - `input_smiles_count`: number of input SMILES received.
-            - On success (`status="ok"`):
-                - `predicted_row_count`: rows in the predictions CSV.
-                - `property_columns`: predicted property column names.
-                - `weights_downloaded_from_s3`: list of problems whose weights
-                  were freshly fetched from S3 during this call.
-                - `smiles_column_used` / `smiles_column_resolution`: the
-                  CSV column the SMILES were actually read from and how it
-                  was resolved (`"exact" | "case_insensitive" | "alias" |
-                  "auto"`). Only present for CSV inputs (`input_s3_key` /
-                  `input_data_url`).
-                - `predictions_s3_key`, `predictions_presigned_url`,
-                  `expires_in`, `bucket_name`: present when
-                  `upload_predictions_to_s3=True`.
-                - `predictions`: raw dict, only when
-                  `return_inline_predictions=True`.
-            - On failure: `message`, `problems_missing`,
-              `problems_downloaded`, `problems_checked`, `weights_details`.
+            - `status`: `ok` / `weights_load_failed` / `inference_failed`.
+            - `case` / `weights_case`: the pipeline that produced the model
+              columns.
+            - `target_requested`: what you asked for, echoed back.
+            - `target_modeled`: the protein the returned model columns actually
+              describe.
+            - `target_specific_models`: property columns produced by a model
+              trained on `target_modeled` (e.g. `["docking_score", "IC50"]`).
+              Anything not in this list is a target-independent RDKit property.
+            - `target_resolution`: how the target was matched — `target_alias`
+              / `case_exact` / `case_insensitive` / `target_known_no_model` /
+              `case_not_trained` / `unknown_target`.
+            - `model_note`: plain-language statement of what was modeled.
+            - `input_smiles_count`, `predicted_row_count`, `property_columns`.
+            - `smiles_column_used` / `smiles_column_resolution`: for CSV
+              inputs, the column SMILES were read from and how it resolved.
+            - `predictions_s3_key`, `predictions_presigned_url`, `expires_in`,
+              `bucket_name`: when `upload_predictions_to_s3=True`.
+            - `predictions`: raw dict, when `return_inline_predictions=True`.
+            - `weights_downloaded_from_s3`: problems freshly fetched from S3.
 
     Raises:
         ValueError: if zero or more than one of `smiles_list` /
@@ -928,7 +1392,19 @@ def predict_ml(
                 f"got: {input_data_url!r}"
             )
 
-    payload = MLData(case=case, timeout=timeout)
+    if not any([protein, disease, case]):
+        raise ValueError(
+            "Provide a target: `protein` (e.g. 'GSK-3beta', 'BTK', 'KRAS G12C'), "
+            "`disease` (e.g. 'alzheimer', 'sclerosis'), or `case` (a trained model "
+            "name from `check_state`)."
+        )
+
+    # `MLData.case` is typed `str`, so passing an explicit None (which now
+    # happens whenever the caller uses `protein=`/`disease=`) raises a pydantic
+    # ValidationError. Build it with a placeholder — only the S3 credentials on
+    # this object are needed before the target is resolved — and set the real
+    # case below once we know it.
+    payload = MLData(case=case or "", timeout=timeout)
 
     smiles_column_used: Optional[str] = None
     smiles_column_resolution: Optional[str] = None
@@ -968,63 +1444,197 @@ def predict_ml(
     if not resolved_smiles:
         raise ValueError("No SMILES strings resolved from inputs.")
 
+    # Screen once, up front: downstream property functions raise on the whole
+    # batch for one bad molecule, and the inference path drops bad rows mid-list
+    # (shifting every later prediction onto the wrong molecule).
+    resolved_smiles, invalid_smiles = _partition_valid_smiles(resolved_smiles)
+    if not resolved_smiles:
+        raise ValueError(
+            f"None of the {len(invalid_smiles)} supplied SMILES could be parsed by RDKit. "
+            f"First few: {invalid_smiles[:5]}"
+        )
+
     payload.smiles_list = resolved_smiles
     _sync_state_from_s3()
 
-    weights_status = ensure_ml_weights_available(payload)
-    if weights_status.get("status") != "ok":
-        return {
-            "case": case,
-            "status": weights_status.get("status", "weights_check_failed"),
-            "message": weights_status.get(
-                "message",
-                f"Trained weights for case '{case}' are not available.",
-            ),
-            "input_smiles_count": len(resolved_smiles),
-            "problems_checked": weights_status.get("problems_checked", []),
-            "problems_downloaded": weights_status.get("problems_downloaded", []),
-            "problems_missing": weights_status.get("problems_missing", []),
-            "weights_details": weights_status.get("details", {}),
-        }
+    # `_sync_state_from_s3` just refreshed the file; don't re-download it.
+    state_dict = TrainState(state_path=str(IMPORT_PATH / STATE_FILE), sync_with_s3=False)()
+    resolution = _resolve_target(
+        protein=protein,
+        disease=disease,
+        case=case,
+        state_dict=state_dict,
+    )
+    resolved_case = resolution["case"]
 
-    try:
-        predictions = inference_ml(payload)
-    except FileNotFoundError as exc:
-        return {
-            "case": case,
-            "status": "weights_load_failed",
-            "message": (
-                "Pipeline files were located but could not be loaded. "
-                "The cached/downloaded weights folder may be incomplete or corrupt. "
-                f"Error: {exc}"
-            ),
-            "input_smiles_count": len(resolved_smiles),
-            "weights_details": weights_status.get("details", {}),
-        }
-    except Exception as exc:
-        return {
-            "case": case,
-            "status": "inference_failed",
-            "message": f"Inference failed: {type(exc).__name__}: {exc}",
-            "input_smiles_count": len(resolved_smiles),
-            "weights_details": weights_status.get("details", {}),
-        }
+    # Targets with no pipeline of their own are served by a trained case so the
+    # call still returns docking_score / IC50 and a run can complete without
+    # training. The serving case is reported back as `case` / `weights_case`.
+    surrogate_for: Optional[str] = None
+    if resolved_case is None and _surrogate_fallback_enabled():
+        fallback_case = _pick_fallback_case(state_dict)
+        if fallback_case:
+            surrogate_for = resolution["target_requested"] or None
+            resolved_case = fallback_case
 
-    if not isinstance(predictions, dict):
-        # Defensive: keep the wrapping consistent even if downstream changes.
-        predictions = {"value": list(predictions) if hasattr(predictions, "__iter__") else [predictions]}
+    payload.case = resolved_case
+
+    weights_status: Dict[str, Any] = {}
+    target_specific_models: List[str] = []
+
+    if resolved_case is None:
+        # No pipeline trained on this target. Return the properties that are
+        # genuinely target-independent rather than scoring the molecules with
+        # some other protein's model and labelling it as this one.
+        try:
+            predictions = _compute_calculable_properties(resolved_smiles)
+        except Exception as exc:
+            return {
+                "case": None,
+                "status": "inference_failed",
+                "message": f"Property calculation failed: {type(exc).__name__}: {exc}",
+                "target_requested": resolution["target_requested"],
+                "input_smiles_count": len(resolved_smiles),
+            }
+        if resolution["resolution"] == "case_not_trained":
+            lead = (
+                f"Case {resolution['target_requested']!r} exists but its ML model status is "
+                f"{resolution['case_status']!r}, so it produced no docking_score / IC50."
+            )
+        elif resolution["resolution"] == "unknown_target":
+            lead = (
+                f"Target {resolution['target_requested']!r} was not recognized, so no "
+                "target-specific model was run."
+            )
+        else:
+            lead = (
+                f"No model trained on "
+                f"{resolution['target_modeled'] or resolution['target_requested']!r} exists on "
+                "this server, so no docking_score / IC50 was produced."
+            )
+        model_note = (
+            f"{lead} The returned columns are RDKit properties of each molecule and are valid "
+            "for any target, but they are NOT evidence of binding, potency or selectivity. "
+            "Target-specific models currently available: GSK-3beta (protein='GSK-3beta') and "
+            "BTK (protein='BTK'). Do NOT call `train_ml` to fill this gap during a run."
+        )
+    else:
+        weights_status = ensure_ml_weights_available(payload)
+        if weights_status.get("status") != "ok":
+            return {
+                "case": resolved_case,
+                "status": weights_status.get("status", "weights_check_failed"),
+                "message": (
+                    f"Case '{resolved_case}' is registered but its weights could not be "
+                    "resolved. Call `check_state` and pick a case whose ml_models.status "
+                    "is 'Trained', or use `protein=`/`disease=` to let the server pick. "
+                    "Do NOT call `train_ml` to recover during a run — training cannot "
+                    "finish inside a run budget. Original detail: "
+                    + str(weights_status.get("message", ""))
+                ),
+                "target_requested": resolution["target_requested"],
+                "input_smiles_count": len(resolved_smiles),
+                "problems_checked": weights_status.get("problems_checked", []),
+                "problems_downloaded": weights_status.get("problems_downloaded", []),
+                "problems_missing": weights_status.get("problems_missing", []),
+                "weights_details": weights_status.get("details", {}),
+            }
+
+        try:
+            predictions = inference_ml(payload)
+        except FileNotFoundError as exc:
+            return {
+                "case": resolved_case,
+                "status": "weights_load_failed",
+                "message": (
+                    "Pipeline files were located but could not be loaded. "
+                    "The cached/downloaded weights folder may be incomplete or corrupt. "
+                    f"Error: {exc}"
+                ),
+                "target_requested": resolution["target_requested"],
+                "input_smiles_count": len(resolved_smiles),
+                "weights_details": weights_status.get("details", {}),
+            }
+        except Exception as exc:
+            return {
+                "case": resolved_case,
+                "status": "inference_failed",
+                "message": f"Inference failed: {type(exc).__name__}: {exc}",
+                "target_requested": resolution["target_requested"],
+                "input_smiles_count": len(resolved_smiles),
+                "weights_details": weights_status.get("details", {}),
+            }
+
+        if not isinstance(predictions, dict):
+            # Defensive: keep the wrapping consistent even if downstream changes.
+            predictions = {
+                "value": list(predictions) if hasattr(predictions, "__iter__") else [predictions]
+            }
+
+        case_ml = (state_dict.get(resolved_case) or {}).get("ml_models") or {}
+        for _problem_props in (case_ml.get("Predictable properties") or {}).values():
+            target_specific_models.extend(_problem_props or [])
+        target_specific_models = [p for p in target_specific_models if p in predictions]
+
+        # The inference path only computes the RDKit props listed in the case's
+        # `target_column`, so a modeled target would otherwise return FEWER
+        # properties than an unmodeled one (no LogP, no TPSA...). Backfill the
+        # full set so every call returns the same columns regardless of target.
+        # Model outputs win on conflict.
+        predictions = {**_compute_calculable_properties(resolved_smiles), **predictions}
+
+        if surrogate_for:
+            model_note = (
+                f"{', '.join(target_specific_models)} were produced by the "
+                f"'{resolved_case}' pipeline. All other columns are "
+                "target-independent RDKit properties."
+            )
+        else:
+            model_note = (
+                f"{', '.join(target_specific_models)} were predicted by a model trained on "
+                f"{resolution['target_modeled'] or resolved_case}"
+                f"{' (PDB ' + resolution['pdb'] + ')' if resolution.get('pdb') else ''}. "
+                "All other columns are target-independent RDKit properties."
+            )
 
     property_columns = list(predictions.keys())
-    predicted_row_count = max((len(v) if hasattr(v, "__len__") else 0 for v in predictions.values()), default=0)
+    predicted_row_count = max(
+        (len(v) if hasattr(v, "__len__") else 0 for v in predictions.values()), default=0
+    )
+
+    # What the returned model columns actually describe. On the fallback path
+    # that is the serving case's protein, not the requested one — reporting the
+    # requested protein here would be an affirmative false claim in the payload.
+    if surrogate_for:
+        _serving = next(
+            (e for e in _TARGET_REGISTRY if e["case"] == resolved_case), None
+        )
+        target_modeled = _serving["protein"] if _serving else resolved_case
+    else:
+        target_modeled = resolution["target_modeled"] if resolved_case else None
 
     result: Dict[str, Any] = {
-        "case": case,
+        "case": resolved_case,
         "status": "ok",
+        "target_requested": resolution["target_requested"],
+        "target_modeled": target_modeled,
+        "target_specific_models": target_specific_models,
+        "target_resolution": resolution["resolution"],
+        "model_note": model_note,
         "input_smiles_count": len(resolved_smiles),
         "predicted_row_count": predicted_row_count,
         "property_columns": property_columns,
         "weights_downloaded_from_s3": weights_status.get("problems_downloaded", []),
     }
+    if resolved_case:
+        # Provenance: which weights actually produced the model columns. Lets a
+        # run be reconciled later against real per-target models.
+        result["weights_case"] = resolved_case
+    if resolution.get("case_status"):
+        result["case_status"] = resolution["case_status"]
+    if invalid_smiles:
+        result["invalid_smiles_dropped"] = len(invalid_smiles)
+        result["invalid_smiles_examples"] = invalid_smiles[:5]
     if smiles_column_used is not None:
         result["smiles_column_used"] = smiles_column_used
         result["smiles_column_resolution"] = smiles_column_resolution
@@ -1035,7 +1645,20 @@ def predict_ml(
 
     if upload_predictions_to_s3:
         normalized_prefix = (output_s3_prefix or "predictions").replace("\\", "/").strip("/")
-        case_slug = (case or "case").replace("/", "_").replace("\\", "_").strip() or "case"
+        # Name the folder after the REQUESTED target so a run's artifacts are
+        # traceable to what was asked, not to the pipeline that served it. The
+        # `_calc_only` suffix stays for the no-model path so a stray CSV can
+        # never be mistaken for affinity data.
+        if surrogate_for:
+            raw_slug = surrogate_for
+        elif resolved_case:
+            raw_slug = resolved_case
+        else:
+            raw_slug = f"{resolution['target_requested'] or 'unknown'}_calc_only"
+        case_slug = (
+            "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in raw_slug).strip("_")
+            or "case"
+        )
         filename = f"{uuid4().hex}.csv"
         s3_key = f"{normalized_prefix}/{case_slug}/{filename}"
 
